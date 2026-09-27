@@ -26,8 +26,10 @@ export function installDom() {
   const { window: domWindow, document } = parseHTML('<!doctype html><html><head></head><body></body></html>')
   const hadWindow = Object.prototype.hasOwnProperty.call(globalThis, 'window')
   const hadDocument = Object.prototype.hasOwnProperty.call(globalThis, 'document')
+  const hadNavigator = Object.prototype.hasOwnProperty.call(globalThis, 'navigator')
   const previousWindow = globalThis.window
   const previousDocument = globalThis.document
+  const previousNavigator = globalThis.navigator
 
   const store = new Map()
   const localStorage = {
@@ -61,11 +63,30 @@ export function installDom() {
   define('window', win)
   define('document', document)
 
+  // react-dom's client entry reads `navigator.userAgent` while it is *evaluated*,
+  // and Node only grew a global `navigator` in version 21 — on Node 20 this file's
+  // callers died with "ReferenceError: navigator is not defined" inside
+  // react-dom before a single case could run, which is exactly how the client
+  // suite failed on CI while passing on Node 24.
+  //
+  // It is supplied only where the runtime has none, and shaped like the one Node
+  // 21+ reports, so the newer legs keep their own object and every leg sees the
+  // same kind of value.
+  if (!hadNavigator) {
+    define('navigator', {
+      userAgent: `Node.js/${process.versions.node}`,
+      language: 'en-US',
+      languages: ['en-US'],
+    })
+  }
+
   return () => {
     if (hadWindow) define('window', previousWindow)
     else delete globalThis.window
     if (hadDocument) define('document', previousDocument)
     else delete globalThis.document
+    if (hadNavigator) define('navigator', previousNavigator)
+    else delete globalThis.navigator
   }
 }
 
