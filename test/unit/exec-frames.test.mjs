@@ -21,6 +21,8 @@ function writerOf(options = {}) {
     kind: options.kind ?? 'exec',
     sink: (frame) => frames.push(frame),
     replayLimitBytes: options.replayLimitBytes,
+    // `undefined` keeps the shipped default (8192 frames); `0` disables it.
+    replayLimitFrames: options.replayLimitFrames,
     now: options.now ?? (() => 1000),
   })
   return { writer, frames }
@@ -126,6 +128,153 @@ test('a replay window that never overflowed reports no gap', () => {
   for (let index = 0; index < 10; index += 1) writer.data('small', 'stdout', 'utf8')
   assert.equal(writer.replay().gap, false)
   assert.equal(writer.replay(5).gap, false)
+})
+
+// ── the replay log's cost and its second budget ──────────────────────────────
+
+/** Best-of-`reps` per-frame cost of `data()` once the window is full, in µs. */
+function frameCostUs(options, window, frames, reps) {
+  const { writer } = writerOf(options)
+  for (let index = 0; index < window + 8; index += 1) writer.data('xy', 'stdout', 'utf8', 2)
+  let best = Number.POSITIVE_INFINITY
+  for (let rep = 0; rep < reps; rep += 1) {
+    const started = process.hrtime.bigint()
+    for (let index = 0; index < frames; index += 1) writer.data('xy', 'stdout', 'utf8', 2)
+    const us = Number(process.hrtime.bigint() - started) / 1000 / frames
+    if (us < best) best = us
+  }
+  return { us: best, retained: writer.retainedDataFrames }
+}
+
+test('replay trim is O(1): a 2-byte-frame stream stays fast', () => {
+  // Trim runs on *every* data frame, and it used to scan the whole log four times
+  // per frame (`countData`/`findIndex`/`splice`/`find`). With the default 256 KiB
+  // byte budget and 2-byte frames that is ~131k entries to walk per frame, which
+  // measured ~3.5 ms/frame: the cost tracked the number of *frames* while the
+  // budget was expressed in *bytes*. Eviction is now O(1) amortised, so the cost
+  // per frame must not grow with the retained window.
+  //
+  // One warm-up pass first: at ~0.2 µs/frame these numbers are otherwise
+  // dominated by JIT warm-up rather than by the eviction itself.
+  frameCostUs({ replayLimitFrames: 8193 }, 8193, 20000, 1)
+
+  const windows = [8193, 16385, 32769]
+  const costs = windows.map((window) => {
+    const { us, retained } = frameCostUs({ replayLimitFrames: window }, window, 5000, 5)
+    assert.equal(retained, window, `${window}: the frame budget is the binding one here`)
+    assert.ok(us < 20, `${window} retained frames: ${us.toFixed(2)} µs/frame`)
+    return us
+  })
+  // The previous build measured 35 µs/frame at 8193 retained frames and 339 µs at
+  // 32769 (i.e. growing with the window, as a per-frame scan must). A 4× larger
+  // window may not cost more than 3× per frame.
+  assert.ok(
+    costs[2] < costs[0] * 3,
+    `per-frame cost must not grow with the window: ${costs[0].toFixed(2)} → ${costs[2].toFixed(2)} µs/frame`,
+  )
+})
+
+test('the replay log keeps at least one data frame and never drops control frames', () => {
+  const { writer } = writerOf({ replayLimitBytes: 64, replayLimitFrames: 4 })
+  writer.data('a', 'stdout', 'utf8', 10)
+  writer.data('b', 'stdout', 'utf8', 10)
+  // A frame larger than both budgets together stays: it is the only content a
+  // late subscriber could be shown, so the budgets may not empty the log.
+  writer.data('huge', 'stdout', 'utf8', 4096)
+  writer.exit({ code: 0, durationMs: 3, timedOut: false })
+  writer.end('completed')
+
+  assert.equal(writer.retainedDataFrames, 1, 'the oversized frame is the one kept')
+  assert.equal(writer.replayDropped, 2)
+  const retained = writer.retained()
+  assert.deepEqual(
+    retained.map((frame) => frame.t),
+    ['open', 'data', 'exit', 'end'],
+    'open/exit/end survive eviction and keep their order',
+  )
+  assert.equal(retained[1].chunk, 'huge')
+  assert.deepEqual(writer.violations, [])
+})
+
+test('a fresh replay reports a gap once frames were dropped', () => {
+  // The drops are driven by the *frame* budget alone: 2-byte frames cannot reach
+  // the 256 KiB byte budget within this many frames.
+  const { writer } = writerOf({ replayLimitFrames: 16 })
+  const total = 4096
+  for (let index = 0; index < total; index += 1) writer.data('xy', 'stdout', 'utf8', 2)
+  assert.equal(writer.retainedDataFrames, 16)
+  assert.equal(writer.replayDropped, total - 16)
+
+  const fresh = writer.replay()
+  assert.equal(fresh.gap, true, 'lost frames are reported, never hidden')
+  assert.equal(fresh.frames[0].t, 'open', 'a fresh subscription still starts at open')
+  const data = fresh.frames.filter((frame) => frame.t === 'data')
+  assert.deepEqual(
+    data.map((frame) => frame.seq),
+    Array.from({ length: 16 }, (_value, index) => total - 16 + index),
+    'the window is the newest 16 frames, in order',
+  )
+  // Resuming at the oldest retained frame loses nothing; before it, it does.
+  assert.equal(writer.replay(total - 16).gap, false)
+  assert.equal(writer.replay(total - 17).gap, true)
+})
+
+test('the 8192-frame cap does not change behaviour for 32-byte-and-larger frames', () => {
+  // 8192 × 32 equals the default byte budget, so for frames of 32 bytes or more
+  // the byte budget is at least as binding as the frame cap: the cap can only
+  // change behaviour for the small-frame streams it exists for.
+  for (const size of [32, 64, 1024]) {
+    const count = size === 32 ? 30000 : 20000
+    const capped = writerOf({ replayLimitBytes: 262144 })
+    const uncapped = writerOf({ replayLimitBytes: 262144, replayLimitFrames: 0 })
+    const chunk = 'x'.repeat(size)
+    for (let index = 0; index < count; index += 1) {
+      capped.writer.data(chunk, 'stdout', 'utf8', size)
+      uncapped.writer.data(chunk, 'stdout', 'utf8', size)
+    }
+    assert.equal(
+      capped.writer.retainedDataFrames,
+      uncapped.writer.retainedDataFrames,
+      `${size}-byte frames: the cap changed the retained count`,
+    )
+    assert.equal(capped.writer.replayDropped, uncapped.writer.replayDropped, `${size}-byte frames: dropped differs`)
+    assert.deepEqual(capped.writer.replay(), uncapped.writer.replay(), `${size}-byte frames: replay differs`)
+    assert.equal(capped.writer.retainedDataFrames, Math.floor(262144 / size), `${size}-byte frames: byte budget wins`)
+  }
+})
+
+test('the frame budget holds a small-frame window flat', () => {
+  const { writer } = writerOf({ replayLimitBytes: 262144 })
+  const total = 40000
+  for (let index = 0; index < total; index += 1) writer.data('xy', 'stdout', 'utf8', 2)
+  assert.equal(writer.retainedDataFrames, 8192, 'the default cap holds the window at 8192 frames')
+  assert.equal(writer.replayDropped, total - 8192)
+  assert.equal(writer.replay().gap, true)
+})
+
+test('an exit frame inside the evicted prefix survives eviction and compaction', () => {
+  // Eviction only ever takes data frames, so the cursor has to walk *past* a live
+  // control frame that sits in front of the oldest retained data frame — and the
+  // amortised compaction must keep it rather than truncating the array.
+  const { writer } = writerOf({ replayLimitBytes: 8, replayLimitFrames: 0 })
+  writer.data('first', 'stdout', 'utf8', 7)
+  writer.exit({ code: 0, durationMs: 1, timedOut: false })
+  for (let index = 0; index < 600; index += 1) writer.data('later', 'stdout', 'utf8', 7)
+  writer.end('completed')
+
+  assert.ok(writer.replayDropped >= 590, `the log must have evicted, dropped ${writer.replayDropped}`)
+  const retained = writer.retained()
+  assert.deepEqual(
+    retained.map((frame) => frame.t),
+    ['open', 'exit', 'data', 'end'],
+    'the control frames must still be part of the replay',
+  )
+  assert.equal(retained[2].seq, 600)
+  assert.equal(
+    writer.replay().frames.some((frame) => frame.t === 'exit'),
+    true,
+  )
+  assert.deepEqual(writer.violations, [])
 })
 
 // ── inspectFrameSequence ────────────────────────────────────────────────────

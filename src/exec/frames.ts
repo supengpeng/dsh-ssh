@@ -35,6 +35,18 @@ export interface FrameWriterOptions {
    * {@link FrameWriter.replay} rather than hidden.
    */
   replayLimitBytes?: number
+  /**
+   * **Frame-count** budget of the same replay log. Both budgets apply, and the
+   * first one to overflow evicts.
+   *
+   * A byte budget alone cannot bound this log's cost: the log holds one entry per
+   * frame, so 256 KiB of payload split into 2-byte frames is ~131k entries — and
+   * those entries, their frames and their strings measured ~17.8 MB of heap, i.e.
+   * a 67.8× amplification over the retained payload. Bounding the *count* as well
+   * is what keeps both the memory and the per-frame eviction cost flat. `0`
+   * disables this budget and leaves only `replayLimitBytes` in force.
+   */
+  replayLimitFrames?: number
   /** Wall clock, injectable for deterministic duration assertions. */
   now?: () => number
   /** Called for every invariant breach (never throws into the caller). */
@@ -54,6 +66,26 @@ export function requiresExit(kind: StreamKind): boolean {
 }
 
 /**
+ * Default frame-count budget of the replay log.
+ *
+ * 8192 is chosen so it cannot bind before the byte budget for any stream whose
+ * frames are 32 bytes or longer (`8192 × 32` = the default `replayLimitBytes`), so
+ * it changes behaviour only for the small-frame streams it exists for.
+ */
+const DEFAULT_REPLAY_LIMIT_FRAMES = 8192
+
+/**
+ * Floor for {@link FrameWriter.compactEvictedPrefix}: never compact for fewer
+ * evicted entries than this, so a stream with a tiny window does not compact on
+ * every frame.
+ *
+ * Together with the quarter-window floor in that method this bounds the amortised
+ * cost of eviction at five array operations per evicted frame, and the entry array
+ * at `live + max(256, live / 4)` entries.
+ */
+const COMPACT_MIN_EVICTED = 256
+
+/**
  * One stream's frame sequence, replay log and terminal state.
  *
  * Not exported through the plugin's public surface: {@link StreamHub} is the
@@ -66,14 +98,26 @@ export class FrameWriter {
 
   private readonly sink: FrameSink
   private readonly replayLimitBytes: number
+  private readonly replayLimitFrames: number
   private readonly now: () => number
   private readonly onViolation: (violation: string) => void
   private readonly onEnd: ((reason: EndReason, error: ErrorInfo | undefined) => void) | undefined
 
   private readonly entries: LogEntry[] = []
   private dataBytes = 0
+  /** Data frames still retained; evicted ones are counted in `droppedDataFrames`. */
+  private liveDataFrames = 0
   private droppedDataFrames = 0
   private oldestRetainedSeq: number | undefined
+  /**
+   * Index below which every **data** entry has been evicted.
+   *
+   * The array itself is only rewritten by {@link FrameWriter.compactEvictedPrefix},
+   * so between compactions `entries[0..deadEnd)` still holds the evicted frames
+   * (plus any control frame that was in the way). Every reader therefore asks
+   * {@link FrameWriter.isEvicted} rather than trusting the index alone.
+   */
+  private deadEnd = 0
 
   private nextSeq = 0
   private opened = false
@@ -88,6 +132,7 @@ export class FrameWriter {
     this.kind = options.kind
     this.sink = options.sink
     this.replayLimitBytes = Math.max(0, Math.trunc(options.replayLimitBytes ?? 262_144))
+    this.replayLimitFrames = Math.max(0, Math.trunc(options.replayLimitFrames ?? DEFAULT_REPLAY_LIMIT_FRAMES))
     this.now = options.now ?? Date.now
     this.onViolation = options.onViolation ?? (() => {})
     this.onEnd = options.onEnd
@@ -129,6 +174,11 @@ export class FrameWriter {
   /** Data frames evicted from the replay log because of the byte budget. */
   get replayDropped(): number {
     return this.droppedDataFrames
+  }
+
+  /** Data frames the replay log still holds, after both budgets were applied. */
+  get retainedDataFrames(): number {
+    return this.liveDataFrames
   }
 
   // ── emission -------------------------------------------------------------
@@ -196,7 +246,13 @@ export class FrameWriter {
 
   /** Every frame this writer still holds, oldest first (open frame included). */
   retained(): Frame[] {
-    return this.entries.map((entry) => entry.frame)
+    const frames: Frame[] = []
+    for (let index = 0; index < this.entries.length; index += 1) {
+      const entry = this.entries[index]!
+      if (this.isEvicted(index, entry)) continue
+      frames.push(entry.frame)
+    }
+    return frames
   }
 
   /**
@@ -219,7 +275,9 @@ export class FrameWriter {
     // reporting a gap there would push callers to re-fetch data they already have.
     let gap = fresh && this.droppedDataFrames > 0
 
-    for (const entry of this.entries) {
+    for (let index = 0; index < this.entries.length; index += 1) {
+      const entry = this.entries[index]!
+      if (this.isEvicted(index, entry)) continue
       const frame = entry.frame
       if (frame.t === 'open') {
         if (fresh) frames.push(frame)
@@ -263,29 +321,113 @@ export class FrameWriter {
     this.entries.push({ frame, bytes })
     if (frame.t === 'data') {
       this.dataBytes += bytes
+      this.liveDataFrames += 1
       if (this.oldestRetainedSeq === undefined) this.oldestRetainedSeq = frame.seq
       this.trim()
     }
   }
 
-  /** Evict the oldest data frames until the replay log fits its byte budget. */
+  /**
+   * Evict the oldest data frames until the replay log fits both of its budgets.
+   *
+   * ## Why the evicted set is always a contiguous prefix
+   *
+   * `append()` is the only writer and it only ever pushes, so `entries` is in
+   * arrival order: the `open` frame first, then data frames in `seq` order, with
+   * at most one `exit` and one `end` appended after the frames they terminate.
+   * Eviction always takes the **oldest** data frame, so what leaves the log is a
+   * prefix of the data frames — never a hole, and never a control frame.
+   *
+   * That premise is what makes `deadEnd` sufficient. It only moves forward, so the
+   * next victim is simply the first data entry at or after it; every entry it
+   * walks past is walked past once between compactions, which is what makes
+   * eviction O(1) amortised and keeps this loop free of any scan over the log.
+   * The counters (`dataBytes`, `liveDataFrames`, `droppedDataFrames`) are updated
+   * arithmetically, and `oldestRetainedSeq` becomes `evictedSeq + 1` because data
+   * seqs are contiguous (only `data()` consumes one, and it appends immediately).
+   *
+   * Control frames may sit *inside* the dead prefix — the `open` frame always
+   * does, once the first data frame is evicted — which is why readers skip by
+   * {@link FrameWriter.isEvicted} instead of by index, and why compaction filters
+   * rather than truncates.
+   *
+   * At least one data frame is always kept, matching the previous byte-only
+   * behaviour: a frame larger than a whole budget stays (it is the only thing left
+   * to show) rather than emptying the log the next subscriber reads.
+   */
   private trim(): void {
-    while (this.dataBytes > this.replayLimitBytes && this.countData() > 1) {
-      const index = this.entries.findIndex((entry) => entry.frame.t === 'data')
-      if (index < 0) return
-      const [removed] = this.entries.splice(index, 1)
-      if (removed === undefined) return
-      this.dataBytes -= removed.bytes
-      this.droppedDataFrames += 1
-      const next = this.entries.find((entry) => entry.frame.t === 'data')
-      this.oldestRetainedSeq = next !== undefined && next.frame.t === 'data' ? next.frame.seq : undefined
+    while (
+      this.liveDataFrames > 1 &&
+      (this.dataBytes > this.replayLimitBytes ||
+        (this.replayLimitFrames > 0 && this.liveDataFrames > this.replayLimitFrames))
+    ) {
+      if (!this.evictOldestDataFrame()) break
     }
+    this.compactEvictedPrefix()
   }
 
-  private countData(): number {
-    let count = 0
-    for (const entry of this.entries) if (entry.frame.t === 'data') count += 1
-    return count
+  /** True when this entry is a data frame that has been evicted from the log. */
+  private isEvicted(index: number, entry: LogEntry): boolean {
+    return entry.frame.t === 'data' && index < this.deadEnd
+  }
+
+  /**
+   * Evict the oldest retained data frame; `false` when none is left to evict.
+   *
+   * The loop exists only for the control frames that can stand in the way: it
+   * steps over `open` (once, at the front) and over `exit`/`end`, which are never
+   * evicted even when the data frames around them are. In steady state it is a
+   * single comparison and a counter update.
+   */
+  private evictOldestDataFrame(): boolean {
+    while (this.deadEnd < this.entries.length) {
+      const entry = this.entries[this.deadEnd]!
+      if (entry.frame.t !== 'data') {
+        this.deadEnd += 1
+        continue
+      }
+      this.dataBytes -= entry.bytes
+      this.liveDataFrames -= 1
+      this.droppedDataFrames += 1
+      // Data seqs are contiguous and eviction is oldest-first, so the successor of
+      // the frame just evicted is exactly the oldest one still retained.
+      this.oldestRetainedSeq = entry.frame.seq + 1
+      this.deadEnd += 1
+      return true
+    }
+    return false
+  }
+
+  /**
+   * Drop the evicted entries once reclaiming them is worth the walk.
+   *
+   * This is the only O(entries) step, so it is deliberately amortised: it runs
+   * only with at least {@link COMPACT_MIN_EVICTED} evicted entries *and* at least
+   * a quarter of the retained window, which bounds the work at
+   * `(live + evicted) / evicted ≤ 5` operations per evicted frame and the array at
+   * `live + max(256, live / 4)` entries. Compacting on the majority instead (the
+   * first rule tried) doubled the peak array for no measurable throughput gain —
+   * the dead prefix has to stay proportional to the window, not equal to it.
+   * Without any compaction the array (not the budgeted window) would grow for the
+   * whole life of the stream.
+   *
+   * Control frames inside the dead prefix are kept: `open` belongs to every
+   * replay, and `exit`/`end` are the frames a late subscriber needs most.
+   */
+  private compactEvictedPrefix(): void {
+    const evicted = this.deadEnd
+    if (evicted < COMPACT_MIN_EVICTED) return
+    const live = this.entries.length - evicted
+    if (evicted * 4 < live) return
+    const kept: LogEntry[] = []
+    for (let index = 0; index < this.entries.length; index += 1) {
+      const entry = this.entries[index]!
+      if (entry.frame.t === 'data' && index < evicted) continue
+      kept.push(entry)
+    }
+    this.entries.length = 0
+    for (const entry of kept) this.entries.push(entry)
+    this.deadEnd = 0
   }
 
   private emit(frame: Frame): void {

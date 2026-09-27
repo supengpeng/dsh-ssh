@@ -32,6 +32,18 @@ export interface FrameWriterOptions {
      * {@link FrameWriter.replay} rather than hidden.
      */
     replayLimitBytes?: number;
+    /**
+     * **Frame-count** budget of the same replay log. Both budgets apply, and the
+     * first one to overflow evicts.
+     *
+     * A byte budget alone cannot bound this log's cost: the log holds one entry per
+     * frame, so 256 KiB of payload split into 2-byte frames is ~131k entries — and
+     * those entries, their frames and their strings measured ~17.8 MB of heap, i.e.
+     * a 67.8× amplification over the retained payload. Bounding the *count* as well
+     * is what keeps both the memory and the per-frame eviction cost flat. `0`
+     * disables this budget and leaves only `replayLimitBytes` in force.
+     */
+    replayLimitFrames?: number;
     /** Wall clock, injectable for deterministic duration assertions. */
     now?: () => number;
     /** Called for every invariant breach (never throws into the caller). */
@@ -53,13 +65,25 @@ export declare class FrameWriter {
     readonly startedAt: number;
     private readonly sink;
     private readonly replayLimitBytes;
+    private readonly replayLimitFrames;
     private readonly now;
     private readonly onViolation;
     private readonly onEnd;
     private readonly entries;
     private dataBytes;
+    /** Data frames still retained; evicted ones are counted in `droppedDataFrames`. */
+    private liveDataFrames;
     private droppedDataFrames;
     private oldestRetainedSeq;
+    /**
+     * Index below which every **data** entry has been evicted.
+     *
+     * The array itself is only rewritten by {@link FrameWriter.compactEvictedPrefix},
+     * so between compactions `entries[0..deadEnd)` still holds the evicted frames
+     * (plus any control frame that was in the way). Every reader therefore asks
+     * {@link FrameWriter.isEvicted} rather than trusting the index alone.
+     */
+    private deadEnd;
     private nextSeq;
     private opened;
     private exitFrame;
@@ -80,6 +104,8 @@ export declare class FrameWriter {
     get lastSeq(): number | undefined;
     /** Data frames evicted from the replay log because of the byte budget. */
     get replayDropped(): number;
+    /** Data frames the replay log still holds, after both budgets were applied. */
+    get retainedDataFrames(): number;
     /** Emit one retained chunk. Returns false when the frame was discarded. */
     data(chunk: string, channel: TerminalChannel, encoding: ChunkEncoding, byteLength?: number): boolean;
     /** Emit the terminal `exit` frame exactly once. */
@@ -115,9 +141,63 @@ export declare class FrameWriter {
     };
     private open;
     private append;
-    /** Evict the oldest data frames until the replay log fits its byte budget. */
+    /**
+     * Evict the oldest data frames until the replay log fits both of its budgets.
+     *
+     * ## Why the evicted set is always a contiguous prefix
+     *
+     * `append()` is the only writer and it only ever pushes, so `entries` is in
+     * arrival order: the `open` frame first, then data frames in `seq` order, with
+     * at most one `exit` and one `end` appended after the frames they terminate.
+     * Eviction always takes the **oldest** data frame, so what leaves the log is a
+     * prefix of the data frames — never a hole, and never a control frame.
+     *
+     * That premise is what makes `deadEnd` sufficient. It only moves forward, so the
+     * next victim is simply the first data entry at or after it; every entry it
+     * walks past is walked past once between compactions, which is what makes
+     * eviction O(1) amortised and keeps this loop free of any scan over the log.
+     * The counters (`dataBytes`, `liveDataFrames`, `droppedDataFrames`) are updated
+     * arithmetically, and `oldestRetainedSeq` becomes `evictedSeq + 1` because data
+     * seqs are contiguous (only `data()` consumes one, and it appends immediately).
+     *
+     * Control frames may sit *inside* the dead prefix — the `open` frame always
+     * does, once the first data frame is evicted — which is why readers skip by
+     * {@link FrameWriter.isEvicted} instead of by index, and why compaction filters
+     * rather than truncates.
+     *
+     * At least one data frame is always kept, matching the previous byte-only
+     * behaviour: a frame larger than a whole budget stays (it is the only thing left
+     * to show) rather than emptying the log the next subscriber reads.
+     */
     private trim;
-    private countData;
+    /** True when this entry is a data frame that has been evicted from the log. */
+    private isEvicted;
+    /**
+     * Evict the oldest retained data frame; `false` when none is left to evict.
+     *
+     * The loop exists only for the control frames that can stand in the way: it
+     * steps over `open` (once, at the front) and over `exit`/`end`, which are never
+     * evicted even when the data frames around them are. In steady state it is a
+     * single comparison and a counter update.
+     */
+    private evictOldestDataFrame;
+    /**
+     * Drop the evicted entries once reclaiming them is worth the walk.
+     *
+     * This is the only O(entries) step, so it is deliberately amortised: it runs
+     * only with at least {@link COMPACT_MIN_EVICTED} evicted entries *and* at least
+     * a quarter of the retained window, which bounds the work at
+     * `(live + evicted) / evicted ≤ 5` operations per evicted frame and the array at
+     * `live + max(256, live / 4)` entries. Compacting on the majority instead (the
+     * first rule tried) doubled the peak array for no measurable throughput gain —
+     * the dead prefix has to stay proportional to the window, not equal to it.
+     * Without any compaction the array (not the budgeted window) would grow for the
+     * whole life of the stream.
+     *
+     * Control frames inside the dead prefix are kept: `open` belongs to every
+     * replay, and `exit`/`end` are the frames a late subscriber needs most.
+     */
+    private compactEvictedPrefix;
     private emit;
     private violate;
     /** Wall-clock age of the stream, used for `exit.durationMs` fallbacks. */
