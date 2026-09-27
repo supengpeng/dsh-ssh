@@ -27,7 +27,8 @@
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
 import { SshError, toErrorInfo } from '../protocol.js'
-import type { SessionInfo } from '../protocol.js'
+import type { ActivityStatus, SessionInfo } from '../protocol.js'
+import type { ActivityFeed } from '../activity/feed.js'
 import { toSftpError } from '../sftp/errors.js'
 import type {
   DirEntry,
@@ -38,6 +39,7 @@ import type {
   TransferProgress,
   TransferVerify,
 } from '../sftp/index.js'
+import { beginActivity, chunkActivity, finishActivity, noteOf, recordActivity, statusOfCode, targetOf } from './activity.js'
 
 /** Tool names, in the order they are registered (ICD §0). */
 export const FILES_TOOL_NAMES = ['ssh_upload', 'ssh_download', 'ssh_list_dir'] as const
@@ -74,6 +76,15 @@ export interface TransferToolRequest {
  * doubles — no SSH connection, no filesystem.
  */
 export interface FilesToolDeps {
+  /**
+   * The agent-activity mirror (ICD §4.7).
+   *
+   * Optional because the mirror is an observation, not a dependency: a composition
+   * built without one (or a unit double older than the subsystem) must still
+   * transfer files. When present, every call is recorded — progress lines included —
+   * and the tool result is unaffected either way.
+   */
+  activity?: ActivityFeed
   /** Structured logger; progress lines land here. */
   log?: TransferLogger
   /** `sftp.*` defaults, purely informational for the description text. */
@@ -606,24 +617,40 @@ function transferTool(deps: FilesToolDeps, direction: 'upload' | 'download'): To
       const verify = optEnum(raw, 'verify', ['none', 'size+mtime', 'sha256'] as const, errors)
       const timeoutMs = optInteger(raw, 'timeoutMs', errors, { min: MIN_TRANSFER_TIMEOUT_MS, max: MAX_TRANSFER_TIMEOUT_MS })
       const base = emptyTransfer(sessionId ?? '', direction, localPath ?? '', remotePath ?? '')
+      const subject = transferSubject(direction, localPath, remotePath)
       if (!errors.ok) {
-        return refusedTransfer(base, new SshError('SSH_CFG_INVALID', `invalid arguments: ${errors.messages.join('; ')}`))
+        const value = refusedTransfer(base, new SshError('SSH_CFG_INVALID', `invalid arguments: ${errors.messages.join('; ')}`))
+        recordRefusedTransfer(deps, direction, subject, sessionId, value)
+        return value
       }
       if (sessionId === undefined || localPath === undefined || remotePath === undefined) {
-        return refusedTransfer(base, new SshError('SSH_CFG_INVALID', 'sessionId, localPath and remotePath are required'))
+        const value = refusedTransfer(base, new SshError('SSH_CFG_INVALID', 'sessionId, localPath and remotePath are required'))
+        recordRefusedTransfer(deps, direction, subject, sessionId, value)
+        return value
       }
       const session = deps.getSession(sessionId)
       if (session === undefined) {
-        return refusedTransfer(
+        const value = refusedTransfer(
           base,
           new SshError('SSH_STATE_INVALID', `no live session with id "${sessionId}"; call ssh_sessions first`),
         )
+        recordRefusedTransfer(deps, direction, subject, sessionId, value)
+        return value
       }
 
       const controller = new AbortController()
       const unlink = forwardSignal(exec.signal, controller)
       const timer = armDeadline(timeoutMs ?? deadline, controller)
       let lastLog = 0
+      let lastMirror = 0
+      // Opened before the transfer starts, so a reader sees it begin and not only its
+      // outcome; closed on both exits below (a `running` record is never evicted).
+      const activity = beginActivity(deps.activity, {
+        kind: direction,
+        subject,
+        sessionId,
+        target: targetOf(session.user, session.host),
+      })
       try {
         const outcome = await deps.transfer({
           sessionId,
@@ -638,21 +665,28 @@ function transferTool(deps: FilesToolDeps, direction: 'upload' | 'download'): To
           signal: controller.signal,
           onProgress: (progress) => {
             const now = Date.now()
-            if (now - lastLog < PROGRESS_LOG_INTERVAL_MS) return
-            lastLog = now
-            const percent = progress.totalBytes === undefined || progress.totalBytes === 0
-              ? '?'
-              : `${Math.floor((progress.transferred / progress.totalBytes) * 100)}%`
-            safeLog(
-              deps.log,
-              `dsh-ssh: ${name} ${percent} (${formatBytes(progress.transferred)}` +
-                `${progress.totalBytes === undefined ? '' : `/${formatBytes(progress.totalBytes)}`}, ${progress.phase}, ${formatRate(progress.bytesPerSec)})`,
-            )
+            if (now - lastLog >= PROGRESS_LOG_INTERVAL_MS) {
+              lastLog = now
+              safeLog(deps.log, `dsh-ssh: ${progressLine(name, progress)}`)
+            }
+            // The panel gets the same bounded cadence as the log, never one line per
+            // chunk: a 100 MiB transfer fires thousands of them, and both sinks are
+            // meant to say "still moving", not to transcribe the transfer.
+            if (now - lastMirror >= PROGRESS_LOG_INTERVAL_MS) {
+              lastMirror = now
+              chunkActivity(activity, 'info', `${progressLine(name, progress)}\n`)
+            }
           },
         })
-        return succeededTransfer(base, outcome, [])
+        const value = succeededTransfer(base, outcome, [])
+        finishActivity(activity, {
+          status: 'ok',
+          note: `transferred ${value.transferred} of ${value.totalBytes} bytes in ${value.durationMs} ms (verify ${value.verify})`,
+          text: transferSummaryLine(value),
+        })
+        return value
       } catch (error) {
-        return refusedTransfer(
+        const value = refusedTransfer(
           base,
           toSftpError(error, { op: name, path: direction === 'upload' ? remotePath : localPath }),
           [
@@ -661,6 +695,13 @@ function transferTool(deps: FilesToolDeps, direction: 'upload' | 'download'): To
               : '',
           ].filter((note) => note !== ''),
         )
+        finishActivity(activity, {
+          status: transferStatus(value, exec.signal.aborted),
+          code: value.code,
+          note: noteOf(value.message, ...value.notes),
+          text: `${value.code}: ${value.message}`,
+        })
+        return value
       } finally {
         if (timer !== undefined) clearTimeout(timer)
         unlink()
@@ -722,16 +763,33 @@ function listDirTool(deps: FilesToolDeps): ToolDefinition {
       }
       if (!errors.ok) {
         const info = toErrorInfo(new SshError('SSH_CFG_INVALID', `invalid arguments: ${errors.messages.join('; ')}`))
-        return { ...empty, code: String(info.code), message: info.message, retryable: info.retryable }
+        const value = { ...empty, code: String(info.code), message: info.message, retryable: info.retryable }
+        recordFailedListing(deps, sessionId, path, value)
+        return value
       }
       if (sessionId === undefined || path === undefined) {
         const info = toErrorInfo(new SshError('SSH_CFG_INVALID', 'sessionId and path are required'))
-        return { ...empty, code: String(info.code), message: info.message, retryable: info.retryable }
+        const value = { ...empty, code: String(info.code), message: info.message, retryable: info.retryable }
+        recordFailedListing(deps, sessionId, path, value)
+        return value
       }
-      if (deps.getSession(sessionId) === undefined) {
+      const session = deps.getSession(sessionId)
+      if (session === undefined) {
         const info = toErrorInfo(new SshError('SSH_STATE_INVALID', `no live session with id "${sessionId}"; call ssh_sessions first`))
-        return { ...empty, code: String(info.code), message: info.message, retryable: info.retryable }
+        const value = { ...empty, code: String(info.code), message: info.message, retryable: info.retryable }
+        recordFailedListing(deps, sessionId, path, value)
+        return value
       }
+      // A listing is one summary operation, not a transcript: the record is opened
+      // before the call so the row exists while the directory is being read, and it
+      // is closed in both branches below with the count it produced.
+      const activity = beginActivity(deps.activity, {
+        kind: 'listDir',
+        subject: path,
+        sessionId,
+        target: targetOf(session.user, session.host),
+        cwd: path,
+      })
       try {
         const result = await deps.listDir({
           sessionId,
@@ -750,7 +808,7 @@ function listDirTool(deps: FilesToolDeps): ToolDefinition {
           isSymlink: entry.isSymlink,
           target: entry.target ?? '',
         }))
-        return {
+        const value = {
           ...empty,
           ok: true,
           cwd: result.cwd,
@@ -759,15 +817,25 @@ function listDirTool(deps: FilesToolDeps): ToolDefinition {
           truncated: total > entries.length,
           entries,
         } satisfies ListEnvelope
+        const summary = `${value.count}${value.truncated ? ` of ${total}` : ''} entr${value.count === 1 ? 'y' : 'ies'} in ${value.cwd}`
+        finishActivity(activity, { status: 'ok', note: summary, text: summary })
+        return value
       } catch (error) {
         const info = toErrorInfo(toSftpError(error, { op: 'listDir', path }))
-        return {
+        const value = {
           ...empty,
           code: String(info.code),
           message: info.message,
           retryable: info.retryable,
           details: info.details === undefined ? '' : safeJson(info.details),
         }
+        finishActivity(activity, {
+          status: statusOfCode(value.code),
+          code: value.code,
+          note: value.message,
+          text: `${value.code}: ${value.message}`,
+        })
+        return value
       }
     },
 
@@ -791,6 +859,101 @@ export function filesToolFactories(deps: FilesToolDeps): Record<FilesToolName, (
 export function fileTools(deps: FilesToolDeps): ToolDefinition[] {
   const factories = filesToolFactories(deps)
   return FILES_TOOL_NAMES.map((name) => factories[name]())
+}
+
+// ---------------------------------------------------------------------------
+// The activity mirror (ICD §4.7)
+// ---------------------------------------------------------------------------
+
+/** `local → remote`, with `?` standing in for a path the arguments did not provide. */
+function transferSubject(direction: 'upload' | 'download', localPath: string | undefined, remotePath: string | undefined): string {
+  return `${localPath ?? '?'} ${direction === 'upload' ? '→' : '←'} ${remotePath ?? '?'}`
+}
+
+/**
+ * One progress line, shared by the host log and the mirror.
+ *
+ * Both sinks answer the same question ("still moving, how fast") at the same bounded
+ * cadence, so they format it in one place rather than drifting into two dialects.
+ */
+function progressLine(name: string, progress: TransferProgress): string {
+  const percent =
+    progress.totalBytes === undefined || progress.totalBytes === 0
+      ? '?'
+      : `${Math.floor((progress.transferred / progress.totalBytes) * 100)}%`
+  return (
+    `${name} ${percent} (${formatBytes(progress.transferred)}` +
+    `${progress.totalBytes === undefined ? '' : `/${formatBytes(progress.totalBytes)}`}, ${progress.phase}, ${formatRate(progress.bytesPerSec)})`
+  )
+}
+
+/** The one-line outcome the mirror appends; the model-facing rendering stays in `renderTransfer`. */
+function transferSummaryLine(value: TransferEnvelope): string {
+  const files = value.entries.length > 1 ? ` · ${value.entries.length} files` : ''
+  return (
+    `${value.direction} ${formatBytes(value.transferred)} in ${(value.durationMs / 1000).toFixed(1)}s ` +
+    `(${formatRate(value.bytesPerSec)})${files} · verify ${value.verify}`
+  )
+}
+
+/**
+ * The feed's terminal class for a transfer, from the code its envelope carries.
+ *
+ * An abort is the one ambiguous case — `SSH_SFTP_TRANSFER_ABORTED` is raised both by
+ * a caller cancelling and by the deadline firing — so the caller's own signal is what
+ * decides between `cancelled` and `timeout`.
+ */
+function transferStatus(value: TransferEnvelope, callerAborted: boolean): ActivityStatus {
+  if (value.ok) return 'ok'
+  if (value.code === 'SSH_SFTP_TRANSFER_ABORTED') return callerAborted ? 'cancelled' : 'timeout'
+  return statusOfCode(value.code)
+}
+
+/**
+ * Mirror a transfer that never reached the transport.
+ *
+ * One complete record, written from the same envelope the model receives; a transfer
+ * the tool declined is as much part of "what the model did" as one that ran.
+ */
+function recordRefusedTransfer(
+  deps: FilesToolDeps,
+  direction: 'upload' | 'download',
+  subject: string,
+  sessionId: string | undefined,
+  value: TransferEnvelope,
+): void {
+  const session = sessionId === undefined ? undefined : deps.getSession(sessionId)
+  recordActivity(
+    deps.activity,
+    {
+      kind: direction,
+      subject,
+      sessionId: sessionId ?? null,
+      target: session === undefined ? null : targetOf(session.user, session.host),
+    },
+    { status: transferStatus(value, false), code: value.code, note: noteOf(value.message, ...value.notes) },
+  )
+}
+
+/** Mirror a listing that produced no entries, for whatever reason. */
+function recordFailedListing(
+  deps: FilesToolDeps,
+  sessionId: string | undefined,
+  path: string | undefined,
+  value: ListEnvelope,
+): void {
+  const session = sessionId === undefined ? undefined : deps.getSession(sessionId)
+  recordActivity(
+    deps.activity,
+    {
+      kind: 'listDir',
+      subject: path ?? '',
+      sessionId: sessionId ?? null,
+      target: session === undefined ? null : targetOf(session.user, session.host),
+      cwd: path ?? null,
+    },
+    { status: statusOfCode(value.code), code: value.code, note: value.message },
+  )
 }
 
 function clampTimeout(value: number | undefined): number {

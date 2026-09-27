@@ -2,7 +2,8 @@
  * @module ssh.session.styles
  * @order 200
  *
- * Stylesheet for the session workspace (terminal / command / files / logs).
+ * Stylesheet for the session workspace (terminal / command / files / logs / agent
+ * activity).
  *
  * Two rules shape every declaration here:
  *
@@ -179,6 +180,67 @@ SSH.define('ssh.session.styles', function (SSH) {
 .ssh-ws-modal-title { font-weight:600; font-size:12px; }
 .ssh-ws-modal-body { font-size:11.5px; color:var(--dsw-alias-label-secondary); white-space:pre-wrap; }
 .ssh-ws-modal-foot { display:flex; justify-content:flex-end; gap:6px; }
+
+/* ── agent activity mirror (ICD §4.7) ──────────────────────────────────── */
+/* The pane is a transcript: one block per activity, newest last. Like the logs
+   tab it is a scrolling body, so every block states its own height (flex:0 0 auto)
+   instead of being shrunk by the flex column - otherwise a long transcript would
+   be squeezed into the visible box rather than scrolled. */
+.ssh-ws-activity { flex:1 1 auto; min-height:0; }
+.ssh-ws-activity-switch { display:inline-flex; align-items:center; border:1px solid var(--dsw-alias-border-l2);
+  border-radius:999px; overflow:hidden; background:var(--dsw-alias-bg-layer-2); }
+.ssh-ws-activity-switch-btn { display:inline-flex; align-items:center; gap:5px; border:0; background:transparent;
+  color:var(--dsw-alias-label-secondary); font:inherit; font-size:11.5px; line-height:20px; padding:2px 10px;
+  cursor:pointer; white-space:nowrap; }
+.ssh-ws-activity-switch-btn:hover { color:var(--dsw-alias-label-primary); }
+.ssh-ws-activity-switch-btn[data-active="true"] { background:var(--dsw-alias-bg-layer-1);
+  color:var(--dsw-alias-label-primary); font-weight:600; }
+.ssh-ws-activity-switch-btn:focus-visible { outline:1px solid var(--dsw-alias-brand-primary); outline-offset:-1px; }
+.ssh-ws-activity-unread { display:inline-flex; align-items:center; justify-content:center; min-width:15px; height:15px;
+  padding:0 4px; border-radius:999px; background:var(--dsw-alias-brand-primary); color:var(--dsw-alias-bg-base);
+  font-size:10px; font-weight:600; }
+.ssh-ws-activity-running { display:inline-flex; align-items:center; gap:4px; color:var(--dsw-alias-state-warn-primary);
+  font-size:10.5px; }
+.ssh-ws-activity-list { flex:1 1 auto; min-height:0; overflow:auto; }
+.ssh-ws-activity-entry { flex:0 0 auto; display:flex; flex-direction:column; gap:3px; padding:5px 8px;
+  border-bottom:1px solid var(--dsw-alias-border-l1); }
+/* A running block is marked on its leading edge; the status badge states it in words. */
+.ssh-ws-activity-entry[data-status="running"] { box-shadow:inset 2px 0 0 var(--dsw-alias-state-warn-primary); }
+.ssh-ws-activity-entry[data-status="error"], .ssh-ws-activity-entry[data-status="timeout"],
+.ssh-ws-activity-entry[data-status="refused"] { box-shadow:inset 2px 0 0 var(--dsw-alias-state-error-primary); }
+.ssh-ws-activity-head { display:flex; align-items:baseline; gap:6px; flex-wrap:wrap; font-size:11px; }
+.ssh-ws-activity-time { color:var(--dsw-alias-label-secondary); font-size:10.5px;
+  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.ssh-ws-activity-kind { border:1px solid var(--dsw-alias-border-l1); border-radius:4px; padding:0 4px;
+  color:var(--dsw-alias-label-secondary); font-size:10px; text-transform:lowercase;
+  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.ssh-ws-activity-target { color:var(--dsw-alias-label-secondary); font-size:10.5px; min-width:0; max-width:100%;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.ssh-ws-activity-subject { color:var(--dsw-alias-label-primary); font-size:11.5px; white-space:pre-wrap;
+  word-break:break-word; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.ssh-ws-activity-cwd { color:var(--dsw-alias-label-secondary); font-size:10px;
+  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap:anywhere; }
+.ssh-ws-activity-segs { display:flex; flex-direction:column; gap:3px; flex:0 0 auto; }
+.ssh-ws-activity-seg { margin:0; padding:4px 6px; border:1px solid var(--dsw-alias-border-l1); border-radius:4px;
+  background:var(--dsw-alias-bg-base); color:var(--dsw-alias-label-primary); font-size:11px; line-height:1.45;
+  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre-wrap; word-break:break-word;
+  max-height:220px; overflow:auto; }
+/* stderr is the one channel that must look different at a glance; info is narration. */
+.ssh-ws-activity-seg[data-channel="stderr"] { color:var(--dsw-alias-state-error-primary); }
+.ssh-ws-activity-seg[data-channel="info"] { color:var(--dsw-alias-label-secondary); }
+.ssh-ws-activity-foot { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; font-size:10.5px;
+  color:var(--dsw-alias-label-secondary); font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.ssh-ws-activity-code { color:var(--dsw-alias-state-error-primary); }
+.ssh-ws-activity-note { color:var(--dsw-alias-label-secondary); font-family:inherit; overflow-wrap:anywhere; }
+.ssh-ws-activity-follow { display:inline-flex; align-items:center; color:var(--dsw-alias-label-secondary);
+  font-size:10.5px; }
+.ssh-ws-activity-follow[data-following="true"] { color:var(--dsw-alias-state-success-primary); }
+/* The status badge colours the terminal states (the shared badge only knows ok/denied/error). */
+.ssh-ws-badge[data-outcome="running"] { border-color:var(--dsw-alias-state-warn-primary); }
+.ssh-ws-badge[data-outcome="timeout"], .ssh-ws-badge[data-outcome="refused"] {
+  border-color:var(--dsw-alias-state-warn-primary); }
+.ssh-ws-badge[data-outcome="cancelled"] { border-color:var(--dsw-alias-state-idle-primary); }
 `
 
   let dispose = null

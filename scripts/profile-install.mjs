@@ -12,6 +12,12 @@
  * and a duplicate Loader entry is a load error. The plugin ships its own
  * `cordis.patch.yml` so the bundle path stays available for a clean profile.
  *
+ * It writes TWO managed blocks into the patch layer: the plugin row, and an `hmr`
+ * row that watches this package's source trees so a rebuilt host half is picked up
+ * without an app restart. The second block carries the Windows caveat that made the
+ * obvious configuration (`root: [<package>]` plus the shipped ignore list) silently
+ * useless — see `hmrBlock()`.
+ *
  * Usage (from the plugin package):
  *     node scripts/profile-install.mjs --profile <dir> [--dry-run]
  *     node scripts/profile-install.mjs --profile <dir> --uninstall
@@ -32,6 +38,9 @@ const ENTRY_ID = 'dsh-ssh'
 
 const MARKER_BEGIN = `# >>> dsh-ssh (managed by scripts/profile-install.mjs) >>>`
 const MARKER_END = `# <<< dsh-ssh <<<`
+/** The hot-reload watch row; a separate block because a hand-edited one existed first. */
+const HMR_MARKER_BEGIN = `# >>> dsh-ssh hmr watch (managed by dsh-ssh) >>>`
+const HMR_MARKER_END = `# <<< dsh-ssh hmr watch <<<`
 
 function parseArgs(argv) {
   const args = { profile: null, dryRun: false, uninstall: false, status: false, step: 'both' }
@@ -119,23 +128,75 @@ function managedBlock() {
   ].join('\n')
 }
 
-function applyBlock(text) {
-  const start = text.indexOf(MARKER_BEGIN)
+/**
+ * The managed HMR block.
+ *
+ * A rebuilt host half reaches a running GUI only through hot reload, and the
+ * shipped `hmr` row watches nothing until roots are named. The roots are the three
+ * source trees rather than the package directory, and `ignored` is emptied, because
+ * of a measured Windows defect (2026-09-27): the watcher matches `ignored` against
+ * `relative(baseDir, path)`, where `baseDir` is the *profile* directory — a sibling
+ * of this package. On Windows that path is `..\plugins\dsh-ssh\lib\service.js`:
+ * picomatch does not treat `\` as a separator, so the whole string is one segment
+ * beginning with `.` and the shipped dot-segment pattern ignores **every** file
+ * under the root. A rebuilt `lib/` tree then produced no reload event at all — a
+ * rebuilt host stayed invisible, and re-enabling the row only re-ran `apply()` on
+ * the already-cached module (observed: the same method count before and after).
+ * None of these three roots contains `node_modules` or a dot-directory, so watching
+ * them directly is both correct and cheaper than the whole package.
+ */
+function hmrBlock() {
+  const root = PACKAGE_DIR.split('\\').join('/')
+  return [
+    HMR_MARKER_BEGIN,
+    '# Opt this package into module hot-reload so a rebuilt host half is picked up',
+    '# without an app restart. The shipped default is `root: []` — module roots are',
+    '# opt-in — so an install has to name them.',
+    '#',
+    '# The roots are the source trees (not the package directory) and `ignored` is',
+    '# empty on purpose: on Windows the watch predicate is matched against a path',
+    '# relative to the *profile* directory, which makes the package tree look like a',
+    '# dot-directory and the shipped ignore patterns swallow every event. See',
+    "# src/index.ts's header for the measurement.",
+    '- id: hmr',
+    '  config:',
+    '    root:',
+    `      - ${root}/lib`,
+    `      - ${root}/src`,
+    `      - ${root}/client/src`,
+    '    ignored: []',
+    HMR_MARKER_END,
+    '',
+  ].join('\n')
+}
+
+/** Replace the block between `begin` and `end`, or append it when absent. */
+function applyManaged(text, begin, end, block) {
+  const start = text.indexOf(begin)
   if (start >= 0) {
-    const end = text.indexOf(MARKER_END, start)
-    const after = end >= 0 ? text.indexOf('\n', end) + 1 : text.length
-    return text.slice(0, start) + managedBlock() + text.slice(after)
+    const endIndex = text.indexOf(end, start)
+    const after = endIndex >= 0 ? text.indexOf('\n', endIndex) + 1 : text.length
+    return text.slice(0, start) + block + text.slice(after)
   }
   const separator = text.endsWith('\n') ? '' : '\n'
-  return `${text}${separator}${managedBlock()}`
+  return `${text}${separator}${block}`
+}
+
+/** Remove the block between `begin` and `end`. */
+function removeManaged(text, begin, end) {
+  const start = text.indexOf(begin)
+  if (start < 0) return text
+  const endIndex = text.indexOf(end, start)
+  const after = endIndex >= 0 ? text.indexOf('\n', endIndex) + 1 : text.length
+  return (text.slice(0, start) + text.slice(after)).replace(/\n{3,}/g, '\n\n')
+}
+
+function applyBlock(text) {
+  return applyManaged(applyManaged(text, MARKER_BEGIN, MARKER_END, managedBlock()), HMR_MARKER_BEGIN, HMR_MARKER_END, hmrBlock())
 }
 
 function removeBlock(text) {
-  const start = text.indexOf(MARKER_BEGIN)
-  if (start < 0) return text
-  const end = text.indexOf(MARKER_END, start)
-  const after = end >= 0 ? text.indexOf('\n', end) + 1 : text.length
-  return (text.slice(0, start) + text.slice(after)).replace(/\n{3,}/g, '\n\n')
+  return removeManaged(removeManaged(text, MARKER_BEGIN, MARKER_END), HMR_MARKER_BEGIN, HMR_MARKER_END)
 }
 
 function report(status, profileDir) {
@@ -143,13 +204,15 @@ function report(status, profileDir) {
   const patchFile = join(profileDir, 'cordis.patch.yml')
   const hasDep = existsSync(packageFile) && readFileSync(packageFile, 'utf8').includes(PACKAGE_NAME)
   const hasRow = existsSync(patchFile) && readFileSync(patchFile, 'utf8').includes(MARKER_BEGIN)
+  const hasHmr = existsSync(patchFile) && readFileSync(patchFile, 'utf8').includes(HMR_MARKER_BEGIN)
   const linked = existsSync(join(profileDir, 'node_modules', '@local', 'dsh-ssh'))
   console.log(`${status} — profile: ${profileDir}`)
   console.log(`  package.json dependency : ${hasDep ? 'present' : 'absent'}`)
   console.log(`  cordis.patch.yml row    : ${hasRow ? 'present' : 'absent'}`)
+  console.log(`  hmr watch block         : ${hasHmr ? 'present' : 'absent'}`)
   console.log(`  node_modules link       : ${linked ? 'present' : 'absent'}`)
   console.log(`  package dir             : ${PACKAGE_DIR}`)
-  return { hasDep, hasRow, linked }
+  return { hasDep, hasRow, hasHmr, linked }
 }
 
 const args = parseArgs(process.argv.slice(2))

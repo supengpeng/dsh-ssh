@@ -13,6 +13,7 @@ import type { ResolvedConfig } from '../config.js'
 import type { PluginLogger } from '../logger.js'
 import type { Redactor } from '../redact.js'
 import type { SshAuditor } from '../audit.js'
+import type { ActivityFeed } from '../activity/feed.js'
 import type { SshCredentialResolver } from '../credentials.js'
 import type { KnownHostsVerifierImpl } from '../known-hosts.js'
 import { normalizeProfile, type ConnProfile, type ConnProfilePatch, type ProfileStore, type ProfileDefaults } from '../store.js'
@@ -32,6 +33,15 @@ export interface ApiDeps {
   credentials: SshCredentialResolver
   knownHosts: KnownHostsVerifierImpl
   audit: SshAuditor
+  /**
+   * The mirror of what the *agent* did (ICD §4.7).
+   *
+   * Endpoints read it to serve `followActivity`; the tools write into it. It is
+   * part of `ApiDeps` rather than of the tools' own deps because the browser's
+   * view of it is an endpoint, and an endpoint that had to reach into the tool
+   * layer for its data would invert the dependency.
+   */
+  activity: ActivityFeed
   pool: ConnectionPool
   registry: SessionRegistry
   exec: ExecService

@@ -15,7 +15,7 @@
 | 端到端走查 | `node test/e2e/run.mjs` | **9/9 步通过** |
 | Lint | `node scripts/lint.mjs` | **0 errors**（16 warnings，按"errors=正确性 / warnings=风格"口径不挡验收） |
 | 真机集成 | `npm run test:real`（需 `DSH_SSH_TEST_REAL_*`） | 见标准 2/3/4 |
-| ICD 一致性 | `DSH_SSH_STRICT_ICD=1 node --test test/integration/icd-conformance.test.mjs` | **§4 方法表 39/39 存在**、§5 全 32 码、§3 帧不变式、§8.5 双语 124 键 |
+| ICD 一致性 | `node --test --test-concurrency=1 --test-force-exit --test-timeout=60000 test/integration/icd-conformance.test.mjs` | **7 pass / 1 skip / 0 fail**：**§4 方法表 41/41 存在**、§5 全 32 码、§3 帧不变式、§8.5 双语 **143** 键（2026-09-27 更新，见 §12；本表其余行的全仓数字是更早一次全量运行的快照） |
 
 > 3 个 skip 均**带明确理由**（真机未配置凭据 ×2、§4.2 投影需要活实例 ×1），不是静默跳过。并发纪律见 ICD §12 R9：**同一时刻只允许一份全仓测试**；全仓必须 `--test-force-exit`（实测套件 33.7 s 跑完，此前的"挂住"是多份并发测试互相拖死，不是代码缺陷）。
 
@@ -125,8 +125,8 @@
 
 | 项 | 结果 |
 |---|---|
-| 契约门 | `DSH_SSH_STRICT_ICD=1` 下：§0 包/入口、§0.3 bundle 封套、§5 全 32 错误码（含 `retryable`）、§3 帧不变式（真流上）、**§4 方法表 39/39 存在**、§6 patch 写出全部默认值、§8.5 双语键集合相等 |
-| 冻结面 | 42 个 `@Remote` 端点（7 个流式）；`SftpHandle` 的三个增量可选成员（`start?`/`supportsOffsetWrite?()`/`truncate?`）均逐条记录在 ICD |
+| 契约门 | `DSH_SSH_STRICT_ICD=1` 下：§0 包/入口、§0.3 bundle 封套、§5 全 32 错误码（含 `retryable`）、§3 帧不变式（真流上）、**§4 方法表 41/41 存在**（含 §4.7 的 `followActivity`/`clearActivity`）、§6 patch 写出全部默认值、§8.5 双语键集合相等（**143** 个冻结键）。命令与最新数字见 §12 |
+| 冻结面 | **44** 个 Remote 方法（**8** 个流式：`followSessions`/`exec`/`openShell`/`upload`/`download`/`followAudit`/`followActivity`/`probeStream`）；`SftpHandle` 的三个增量可选成员（`start?`/`supportsOffsetWrite?()`/`truncate?`）均逐条记录在 ICD。**注意**：44 是 `remoteMethods()` 实测总数，其中 3 个（`probeStream`/`describe`/`reportSpike`）是 M0 诊断方法，不在 §4 方法表内 |
 | 编译期防漂移 | `src/exec/compat.ts`、`src/sftp/compat.ts` 做**逐成员双向赋值断言**——本轮实战抓到过一次 ICD 漂移（`endInput`） |
 | 实测驱动的修订 | ICD 共 10 次修订全部有"是什么实测/谁发现"的记录（例如 R1.3"扁平原始值规则"来自 4 次一致的浏览器测量：载荷**遇到第一个非原始值即停止复制**） |
 
@@ -241,3 +241,128 @@ setSecret ok   "persisted": false, "reason": "no credentials service in this com
 - 侧边栏/主题、新建连接与真机连接、`uname -a` + 交互式终端与 `top`、命令通道、**文件页签（导航/上传/下载）**、10 会话并发、凭据零泄漏、known_hosts、100 MiB 传输、文档与工程质量 —— 逐条证据见 §1–§8，UI 侧补充见 §11.1–§11.7。
 - **证据边界（如实）**：① 100 MiB 级传输的闭环在引擎/工具层（真机 100.0 MiB 实测）；UI 侧实测为小文件（6938 B），**不宣称**“UI 端完成 100 MiB 传输”。② GUI 内 `top` 与多会话/主题两项为用户走查确认，未逐条抓取 console 原文，已按“用户确认”标注。
 - 已知缺口与遗留项**仍然有效**，集中在 §9（`serverBanner` 未实现、`@revoked`/问题级 `policy` 未生效、lint warnings、known_hosts 追加行为、`ENOTEMPTY` 映射、机器卫生等），**不因“全通过”而删除**。
+
+---
+
+## 12. ICD §4.7（agent 活动镜像）验收证据（2026-09-27）
+
+> **本节记录的是"ICD §4.7 与实现一致"的**可复现证据**，不是走查观感。**
+> 命令一律在本仓库根目录执行；数字为 2026-09-27 实测值，**未重跑**，原样记录以便对照。
+
+| 层 | 命令 | 结果 |
+|---|---|---|
+| host 类型（第一道门） | `node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit` | **exit 0** |
+| host 单测（聚焦批：`activity-feed` / `activity-api` / `activity-tools` / `api-tools` / `exec-tool` / `sftp-tools` / `service` / `config`，共 8 个文件） | `node --test --test-concurrency=1 --test-force-exit test/unit/activity-feed.test.mjs test/unit/activity-api.test.mjs test/unit/activity-tools.test.mjs test/unit/api-tools.test.mjs test/unit/exec-tool.test.mjs test/unit/sftp-tools.test.mjs test/unit/service.test.mjs test/unit/config.test.mjs`（**逐条列出**：PowerShell 不做 `{}` 展开） | **121 tests / 121 pass / 0 fail** |
+| 组件层 | `node --test --test-concurrency=1 --test-timeout=30000 "test/client/*.test.mjs"` | **255 tests / 255 pass / 0 fail**（含活动面 8、会话卡片 13；此前一轮为 234 + 这 21 个新用例） |
+| 契约门（ICD ↔ 实现） | `node --test --test-concurrency=1 --test-force-exit --test-timeout=60000 test/integration/icd-conformance.test.mjs` | **7 pass / 1 skip / 0 fail**；§4 方法表 **41/41**（含 `followActivity`/`clearActivity`）；§8.5 **163** 个冻结键在 zh/en 双语中齐全（各 214 键、集合相同）；唯一 skip 为 §4.2「需活的服务实例 + 凭据库配置」，**带理由** |
+| 客户端产物确定性 | `node scripts/build-client.mjs --check` | **bundle up to date**（产物与源码一致） |
+
+**§4.7 的验收面覆盖了什么**：
+
+| 契约要点 | 证据 |
+|---|---|
+| `followActivity`（流）与 `clearActivity`（一元）在 host 真实注册 | 契约门 §4 的 **41/41**；另有 `remoteMethods(instance)` 实测 **44** 个 Remote 方法（含这两个） |
+| 帧的三种形状（`activity-snapshot` / `activity` / `activity-reset`）与调度不变式 | `test/unit/activity-feed.test.mjs`（**28** 个用例：环预算、段合并、截断字符边界、幂等 `finish`、订阅者隔离、`clear()` 语义、任何输入都不抛）+ `test/unit/activity-api.test.mjs`（事件→帧映射、首帧即快照）。**交叉核对**：这 8 个文件的 `test()` 静态计数为 28+3+12+15+26+12+14+11 = **121**，与上表实测的 121 一致 |
+| 工具侧埋点（**谁写**） | `test/unit/activity-tools.test.mjs` + `api-tools` / `exec-tool` / `sftp-tools`（工具行为未被镜像改变：仍各自返回原 envelope） |
+| 配置 `activity.*` | `test/unit/config.test.mjs`（schema 默认值）+ 契约门 6（`cordis.patch.yml` 写出默认值） |
+| i18n 与面板文案 | 契约门 §8.5（143 键双语齐全，含 19 个 `ws.activity.*`）；组件层 `test/client/**`（含活动面） |
+| 文档 | `docs/ICD.md` §4.7/§6/§12 R10 与代码逐条对照后写成；§4.7 的两个端点已进入契约门的 §4 断言 |
+
+**独立验证者（independent verifier）**：**已返回**（2026-09-27，独立 agent，未参与实现）。它自己写了两份测试，只读产品代码：
+
+| 验证项 | 独立证据 | 结果 |
+|---|---|---|
+| host 端到端（真实 sshd double + 插件**自己的** `createHostRuntime()` 图 + 注册表里取出的 `ssh_exec`） | `test/integration/activity-e2e.test.mjs` | **8/8 通过** |
+| ——命令的输出是否**边跑边到** | 命令 `echo alpha-out; sleep 1.5; echo omega-out; echo beta-err 1>&2; exit 3`；断言"stdout chunk 到达时 tool 尚未 settle" | 到达早于 settle **1512 ms**（阈值实测后还原） |
+| ——两条通道 + 退出码 + 拒绝 | `end` 帧 `segments` = `['stdout','stderr']`（stdout 顺序保持），`status ok`/`exitCode 3`；未知 `sessionId` → `status 'refused'` + `SSH_STATE_INVALID`；参数非法 → `SSH_CFG_INVALID`；并发两条命令互不污染；`enabled:false` 不记录且不影响 envelope | 全部通过 |
+| `ssh_sessions` schema 回归（缺陷本身） | 真实 session 投影通过声明 schema；把修复前的 `objectNode({})` 换回去 → 12 条拒绝，含原始报错 `"value.sessions[0].sessionId" is not a declared property` | **非空洞**（证明断言有效） |
+| client 端到端（**构建产物** `lib/client.js` + 真 bridge + 真 store + 真 `SshWorkspace`/`SessionView`） | `test/client/activity-panel.test.mjs` | **8/8 通过**（修复后；见下条缺陷） |
+| 对抗项 | `chunk` 落在 `end` 之后不污染已发布记录；`activity-reset` 保留运行中记录且其 `end` 仍到达；空清除不发 reset 帧；`clearActivity` 单次无载荷；面板交互只产生 `clearActivity`（无 exec/键盘/传输流量） | 全部通过 |
+
+**独立验证者发现并已修复的真实缺陷（client 侧）**：`client/src/session/activity.js` 的 `ensureConnected()` 把 handle 写在 `bridge.stream()` **返回之后**，而同步失败会在 `stream()` 内部先送出终止 `end` 帧（`bridge.js` 同时填好 `state.error`）——于是那具"死 handle"被缓存，`if (handle) return handle` 使其永久失效：**host 半边没有 §4.7（就是本机现在的状态）或载体同步抛错时，活动面本次 bundle 生命周期内再也不会重订阅**，只能刷新页面。修复：拒绝缓存 `state.error` 已置位的 handle，并**只警告一次、且点名原因**（原先只打一句通用 `ended`，把"host 版本旧"伪装成"流断了"）。验证者那份"故意失败以钉住缺陷"的测试在修复后转为**回归测试**（8/8）；其两处断言按修复后的契约更新（首次挂载最多两次尝试：开关的 store 订阅 + 面板挂载效应各一次；重挂载不得丢失尝试），失败模式由 Lead 复核。
+
+**在此之前，本节除上表外的数字均出自实现者自测（self-test）**，上表为独立复现。
+
+**如实边界（本节不覆盖的）**：
+1. **没有**真实浏览器里"打开活动面、看着 agent 跑命令"的端到端走查记录；组件层证明的是渲染与交互逻辑，**证明不了**几何与"用户是否看得见"（linkedom 无布局引擎）。
+2. 因此 §4.7 的验收结论是**"契约、单元、组件三层一致"**，不是"UI 已走查通过"。
+
+---
+
+## 13. 宿主半边热更新在本机不可用（Windows，实测 2026-09-27）
+
+> **一句话**：重建 host 半边（`src/**` → `lib/**`）**不会**让运行中的 GUI 拿到新代码；本机要生效**只能重启 DSH**。
+> toggle `include:dsh-ssh` 行**不是**替代方案：它只让 Loader 用**已缓存**的模块重跑一次 `apply()`。
+> 此结论与 ICD §12 R4 的旧表述（"toggle 行即可"）**冲突，以本节为准** —— R4 描述的是"重跑 `apply()`"这一半，漏掉了"模块字节是否重新导入"这一半。
+
+### 13.1 证据（两条数字对不上）
+
+| 观察对象 | 数字 | 取值方式 |
+|---|---|---|
+| 构建产物 `lib/service.js` | **44** 个 Remote 方法（含 `followActivity`/`clearActivity`） | 构造内建类实例后调 `remoteMethods(instance)`（`@deepseek-ai/dsh-typert-protocol`） |
+| 活着的 host 写的 `%DSH_HOME%\logs\dsh-ssh\host-ready.json`（`at: 2026-09-27T04:44:42.447Z`） | **42** 个 Remote 方法，**恰好缺** `followActivity`/`clearActivity` | 该文件由 `src/index.ts` 的 `recordHostReady()` 在**每次 `apply()`** 时写入 |
+| 上述标记的生成时机 | 一次**完整的** `plugin_manager` toggle 之后（`include:dsh-ssh` off→on，`application: "applied"`） | 即"重跑过 `apply()`，方法集仍是旧的" |
+
+`host-ready.json` 的 `remoteMethods` 是**这个进程里实际注册的**端点列表，所以它是判断"新代码有没有进来"的**唯一可靠判据**：console 与插件日志都区分不了"`apply()` 没跑"和"`apply()` 跑了但用的是旧模块"。
+
+### 13.2 根因（追到 picomatch 一层）
+
+shipped `hmr` 行的 `ignored` 默认值是 `['**/node_modules', '**/.*', 'cache', 'data']`（`root` 默认 `['.']`，见 `packages/boot/hmr`）。监视谓词比的不是绝对路径，而是**相对 `baseDir` 的路径**：
+
+```js
+// 摘自 packages/boot/hmr（为说明而合并了行；原文还有 ...this.config 与 ignoreInitial）
+this.baseDir = fileURLToPath(new URL(config.base || '.', ctx.baseUrl))   // = profile 目录
+const watchBaseDir = realpathSync(this.baseDir)
+const match = picomatch(ignored)
+this.watcher = watch(root, { cwd: watchBaseDir, ignored: path => match(relative(watchBaseDir, path)) })
+```
+
+本机 `baseDir` 是 profile 目录（`…\.dsh\profiles\desktop`），而监视根是它的**兄弟**目录 `C:\Users\Administrator\.dsh\plugins\dsh-ssh`：
+
+```
+relative('C:\Users\Administrator\.dsh\profiles\desktop',
+         'C:\Users\Administrator\.dsh\plugins\dsh-ssh\lib\service.js')
+  = '..\..\plugins\dsh-ssh\lib\service.js'
+```
+
+**picomatch 不把 `\` 当分隔符** ⇒ 整个字符串是**一段**、且以 `.` 开头 ⇒ 默认的 `**/.*` 命中 ⇒ **整棵树每个文件都被忽略**，重建 `lib/**` 一个事件都不产生。实测（`packages/boot/hmr/node_modules/picomatch`）：
+
+| 传入 `picomatch([...默认值])` 的字符串 | 返回 | 含义 |
+|---|---|---|
+| `..\..\plugins\dsh-ssh\lib\service.js`（Windows 实态） | **`true`** | 被忽略 ⇒ 无 reload 事件 |
+| `../../plugins/dsh-ssh/lib/service.js`（同路径、正斜杠） | `false` | **证明**分歧来自"反斜杠不是分隔符"，而非路径本身在忽略列表里 |
+| `node_modules/x.js`（profile 内） | `true` | 默认值本身是好的：问题只在"跨目录 + 反斜杠"这个组合 |
+
+（`..` 的层数取决于 profile 与包的相对深度：本机 profile 在 `.dsh\profiles\desktop`、包在 `.dsh\plugins\dsh-ssh`，故为两层。**关键性质是"该相对路径以 `.` 开头的单段"**，与层数无关。）
+
+### 13.3 修复（已写入 profile 的托管块）
+
+`scripts/profile-install.mjs` 的 `hmrBlock()` 现在把监视根**直接指向三个源码树**并**清空 `ignored`**，写在独立托管块 `# >>> dsh-ssh hmr watch (managed by dsh-ssh) >>>` 内：
+
+```yaml
+- id: hmr
+  config:
+    root:
+      - <PACKAGE_DIR>/lib          # 实际写出绝对路径、正斜杠
+      - <PACKAGE_DIR>/src
+      - <PACKAGE_DIR>/client/src
+    ignored: []
+```
+
+`ignored: []` 在此处安全：这三个树里没有 `node_modules`、也没有点目录，默认规则本就没有要挡的东西；同时绝对路径根用正斜杠，绕开了"相对 profile 的路径以 `..` 开头"这一条。只读核对：
+
+```powershell
+node scripts/profile-install.mjs --profile "$env:USERPROFILE\.dsh\profiles\desktop" --status
+#   package.json dependency : present
+#   cordis.patch.yml row    : present
+#   hmr watch block         : present
+#   node_modules link       : present
+```
+
+> **重要限制（必须如实说）**：这次修复**没有**让新代码进入正在运行的 host —— `hmr` 行是启动时装载的，改 profile patch 不会让已加载的监视器按新配置重来。因此 §13.1 的 **42 vs 44 仍是当前运行实例的事实**，而修复是**为下一次 DSH 启动准备**的（是否真的恢复热更新，判据见 `docs/M0-SPIKE.md` §8.4：重启后改一处 `src/**`、重建，看 `host-ready.json` 的方法集是否跟随）。
+
+**对维护者的操作含义**（同时写进 `docs/TESTING.md` §2.5 与 `README.md` FAQ）：
+
+1. 改 host 后**不要**用"toggle 了行、页面没变化"判断自己的代码有问题 —— 先看 `host-ready.json` 的方法数/字段有没有变。
+2. client 半边不受影响：`lib/client.js` 字节变化仍会触发页面重新 `apply()`。
+3. **配置值**变更与**模块代码**变更要分开看：前者的载体是每次 `apply()` 都会重新读取的 profile patch，因此 toggle 行有效；后者卡在模块缓存上，toggle 无效。

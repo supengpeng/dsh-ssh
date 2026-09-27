@@ -47,6 +47,7 @@ export function makeConfig(overrides = {}) {
     },
     secrets: { provider: 'credentials', envPrefix: 'DSH_SSH_' },
     logging: { level: 'error', redact: true, redactKeys: ['password', 'passphrase', 'privateKey'] },
+    activity: { enabled: true, maxRecords: 200, maxRecordBytes: 65536, maxTotalBytes: 1048576 },
     ui: { defaultWidthPx: 420, locale: 'auto', terminalFontSize: 13, reconnectAttempts: 5 },
     maxLocalBytes: 1024 * 1024 * 1024,
   }
@@ -57,6 +58,7 @@ export function makeConfig(overrides = {}) {
     hostKey: { ...base.hostKey, ...(overrides.hostKey ?? {}) },
     sftp: { ...base.sftp, ...(overrides.sftp ?? {}) },
     logging: { ...base.logging, ...(overrides.logging ?? {}) },
+    activity: { ...base.activity, ...(overrides.activity ?? {}) },
     ui: { ...base.ui, ...(overrides.ui ?? {}) },
   }
 }

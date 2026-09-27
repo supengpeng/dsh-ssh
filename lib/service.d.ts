@@ -20,7 +20,7 @@ export interface ServiceLogger {
     error(message: string): void;
 }
 /** Plugin version, duplicated from package.json at build time. */
-export declare const PLUGIN_VERSION = "0.1.0";
+export declare const PLUGIN_VERSION = "0.2.0";
 /** Constructor options; `probeWire` exists only for the M0.5 measurement. */
 export interface SshPluginServiceOptions {
     /**
@@ -159,6 +159,15 @@ export declare class SshPluginService {
     followAudit(raw?: unknown): AsyncIterable<Frame>;
     /** ICD §4.6 `clearAudit`. */
     clearAudit(): Promise<unknown>;
+    /**
+     * ICD §4.7 `followActivity` (stream).
+     *
+     * No parameter object: the mirror is global by design (see `ActivityApi`), so
+     * there is nothing for the client to narrow and nothing the host could refuse.
+     */
+    followActivity(raw?: unknown): AsyncIterable<Frame>;
+    /** ICD §4.7 `clearActivity`. */
+    clearActivity(): Promise<unknown>;
     /**
      * The runtime, or an honest error when the service was built without one.
      *

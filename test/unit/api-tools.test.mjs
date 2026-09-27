@@ -20,6 +20,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
 
+import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+
+import { ActivityFeed } from '../../lib/activity/feed.js'
 import { createAuditor } from '../../lib/audit.js'
 import { Config, resolveConfig } from '../../lib/config.js'
 import { LocalApi } from '../../lib/api/local-api.js'
@@ -103,10 +106,14 @@ function harness(options = {}) {
     config, logger, redactor, store, audit, pool, registry,
     exec: {
       limits: { maxOutputBytes: 1024, operationTimeoutMs: 1000, graceKillMs: 100 },
+      // Faithful to `ExecService` in the two places the tools rely on: the session a
+      // call actually targets, and the `binary` flags of a finished result.
+      resolveTargetSession: (requested) => requested ?? 's_1',
+      sessions: () => [...sessions.values()].map((handle) => ({ id: handle.id, host: handle.info.host, user: handle.info.user, state: handle.state })),
       exec: () => ({ streamId: 'st', done: Promise.resolve({}) }),
       openShell: () => ({ streamId: 'st', done: Promise.resolve({}) }),
       async execWait() {
-        return { streamId: 'st', exitCode: 0, stdout: 'ok\n', stderr: '', truncated: { stdout: false, stderr: false }, durationMs: 1, timedOut: false, endReason: 'completed', bytes: { stdout: 3, stderr: 0 } }
+        return { streamId: 'st', exitCode: 0, stdout: 'ok\n', stderr: '', truncated: { stdout: false, stderr: false }, durationMs: 1, timedOut: false, endReason: 'completed', bytes: { stdout: 3, stderr: 0 }, binary: { stdout: false, stderr: false } }
       },
       subscribe: () => ({ unsubscribe() {}, replayed: 0, gap: false, finished: true }),
       shellWrite: () => ({ written: 0 }),
@@ -137,8 +144,11 @@ function harness(options = {}) {
   const api = new LocalApi(deps)
 
   // The registry the plugin registers into, captured so a test can invoke exactly
-  // what the agent loop would see.
+  // what the agent loop would see. The activity mirror is real here: the point of
+  // these tools is that what the model does is visible in the panel, and that is a
+  // property of the composition, not of one tool in isolation.
   const registered = new Map()
+  const activity = new ActivityFeed({ logger: { warn() {} } })
   const ctx = {
     tools: {
       register(tool) {
@@ -147,8 +157,8 @@ function harness(options = {}) {
       },
     },
   }
-  const registration = options.skipRegistration === true ? undefined : registerAgentTools({ ctx, config, exec: deps.exec, pool, registry, transfers: deps.transfers, audit, log: logger, api })
-  return { config, store, audit, registry, pool, api, ctx, registered, registration, acquired, closed, deps }
+  const registration = options.skipRegistration === true ? undefined : registerAgentTools({ ctx, config, exec: deps.exec, pool, registry, transfers: deps.transfers, audit, log: logger, api, activity })
+  return { config, store, audit, registry, pool, api, ctx, registered, registration, acquired, closed, deps, activity }
 }
 
 /** Run a registered tool the way the registry does: `execute(args, runContext)`. */
@@ -195,6 +205,7 @@ test('a composition without a tools registry skips everything without throwing',
     audit: h.audit,
     log: { debug() {}, info() {}, warn() {}, error() {} },
     api: h.api,
+    activity: h.activity,
   })
   assert.deepEqual(registration.registered, [])
   assert.equal(registration.skipped.length, 7)
@@ -214,6 +225,7 @@ test('allowAgentTools: false registers nothing and says why', () => {
     audit: h.audit,
     log: { debug() {}, info() {}, warn() {}, error() {} },
     api: h.api,
+    activity: h.activity,
   })
   assert.deepEqual(registration.registered, [])
   assert.match(registration.skipped[0].reason, /allowAgentTools is false/)
@@ -313,6 +325,57 @@ test('ssh_sessions is usable before anything is connected', async () => {
   assert.equal(result.ok, true)
   assert.deepEqual(result.sessions, [])
   assert.match(result.notes.join(' '), /ssh_connect/)
+})
+
+// ---------------------------------------------------------------------------
+// The activity mirror, through the real registration
+// ---------------------------------------------------------------------------
+
+test('the registered tools record what the model did, refusals included', async () => {
+  const h = harness()
+  const connected = await callTool(h, 'ssh_connect', { host: 'h.example', user: 'deploy' })
+  await callTool(h, 'ssh_exec', { command: 'uptime' })
+  await callTool(h, 'ssh_list_dir', { sessionId: 's_nope', path: '/home/deploy' })
+  await callTool(h, 'ssh_sessions', {})
+
+  const byKind = new Map(h.activity.snapshot().map((record) => [record.kind, record]))
+  assert.deepEqual(
+    [...byKind.keys()].sort(),
+    ['connect', 'exec', 'listDir', 'sessions'],
+    'every kind of work the model did reached the feed',
+  )
+  assert.equal(byKind.get('connect').status, 'ok')
+  assert.equal(byKind.get('connect').target, 'deploy@h.example')
+  assert.equal(byKind.get('connect').note, `connected ${connected.sessionId} as deploy@h.example:22`)
+  assert.equal(byKind.get('exec').sessionId, 's_1')
+  assert.equal(byKind.get('exec').subject, 'uptime')
+  // A refused listing never touched SFTP, and says so rather than looking like work.
+  assert.equal(byKind.get('listDir').status, 'refused')
+  assert.equal(byKind.get('listDir').code, 'SSH_STATE_INVALID')
+  assert.equal(byKind.get('sessions').note, '1 connected: s_1')
+})
+
+test('the registered ssh_sessions schema accepts the real session projection (regression)', async () => {
+  const h = harness()
+  const connected = await callTool(h, 'ssh_connect', { host: 'h.example', user: 'deploy' })
+  const tool = h.registered.get('ssh_sessions')
+  const listed = await callTool(h, 'ssh_sessions', {})
+  assert.equal(listed.sessions.length, 1)
+  assert.equal(listed.sessions[0].sessionId, connected.sessionId)
+
+  // The Host validates the value against this declaration before the model sees it.
+  // The declaration used to be `items: objectNode({})`, a closed empty object node,
+  // so the real list was rejected with "value.sessions[0].sessionId is not a declared
+  // property" and the tool answered "tool returned invalid output" for a call that
+  // had actually succeeded.
+  assert.deepEqual(validateJsonSchemaValue(tool.output.schema, listed), [])
+  assert.deepEqual(validateJsonSchemaValue(tool.output.schema, { ok: true, notes: [], sessions: [] }), [])
+
+  const items = tool.output.schema.properties.sessions.items
+  assert.equal(items.additionalProperties, false)
+  assert.ok(Object.keys(items.properties).includes('sessionId'))
+  assert.ok(Object.keys(items.properties).includes('capabilities'))
+  assert.equal(items.required.includes('rttMs'), false, 'rttMs is omitted until the connection has been measured')
 })
 
 test('ssh_disconnect without a sessionId lists the alternatives', async () => {

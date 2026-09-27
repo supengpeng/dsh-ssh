@@ -27,6 +27,19 @@
  * HMR only watches module roots that are explicitly opted in (the shipped `hmr` row
  * defaults to `root: []`), so this package adds its own directory to that row in the
  * live profile patch; without it a rebuilt host half stays invisible until restart.
+ *
+ * **Measured Windows caveat (2026-09-27):** adding the root is necessary but not
+ * sufficient. The row's shipped `ignored` default begins with a pattern that matches
+ * any dot-prefixed segment, and the watcher matches it against
+ * `relative(baseDir, path)` — where `baseDir` is the *profile* directory, a sibling
+ * of this package. On Windows that path is `..\plugins\dsh-ssh\lib\service.js`:
+ * picomatch does not treat `\` as a separator, so the whole string is one segment
+ * that begins with `.` and the default pattern ignores every file under the root.
+ * A rebuilt `lib` tree then produces no reload event at all (observed: `apply()`
+ * re-ran from the row toggle and still reported the previous method count). The live
+ * row therefore watches the three source trees directly and passes `ignored: []`,
+ * which is also cheaper: none of them contains `node_modules` or a dot-directory.
+ * The full explanation lives in the profile patch's managed block.
  */
 
 import { mkdirSync, writeFileSync } from 'node:fs'

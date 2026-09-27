@@ -12,10 +12,12 @@
  * const session = SSH.require('ssh.session')
  * session.configure({ bridge, app })          // once, from the plugin body
  * const { TerminalTab, CommandPanel, FileManager, LogTab } = session.components()
+ * const { AgentActivityPane, AgentActivitySwitch } = session.activityComponents()
  * ```
  *
  * `configure` is a passthrough to the runtime so the plugin body needs one require
- * and no knowledge of the tab internals.
+ * and no knowledge of the tab internals. The agent-activity mirror lives on its own
+ * accessor for the reason spelled out at `activityComponents()` below.
  */
 
 SSH.define('ssh.session', function (SSH) {
@@ -48,6 +50,27 @@ SSH.define('ssh.session', function (SSH) {
       CommandPanel: SSH.require('ssh.session.command').CommandPanel,
       FileManager: SSH.require('ssh.session.files').FileManager,
       LogTab: SSH.require('ssh.session.logs').LogTab,
+    }
+  }
+
+  /**
+   * The agent-activity mirror (ICD §4.7), as its own surface.
+   *
+   * Deliberately **not** keys of `components()`: that object is pinned to the four
+   * frozen §8.3 workspace components by `test/client/session.test.mjs`
+   * ("ssh.session exposes the four frozen components" — an exact
+   * `Object.keys(...).sort()` comparison), so growing it there would convert a
+   * frozen set into a failing test instead of an added capability. Both are plain
+   * components of props and are re-exported here — next to `configure`/`runtime` —
+   * so a test, a later seat or the demo harness reaches them the same way.
+   * (`client/src/panel.js`, the real mount point, requires `ssh.session.activity`
+   * directly and tolerates the module being absent.)
+   */
+  function activityComponents() {
+    const activity = SSH.require('ssh.session.activity')
+    return {
+      AgentActivityPane: activity.AgentActivityPane,
+      AgentActivitySwitch: activity.AgentActivitySwitch,
     }
   }
 
@@ -153,5 +176,17 @@ SSH.define('ssh.session', function (SSH) {
     return h('div', { className: 'ssh-ws', 'data-testid': 'ssh-ws-standalone' }, strip, body)
   }
 
-  return { configure, runtime, components, installStyles, StandaloneWorkspace, TAB_IDS }
+  return {
+    configure,
+    runtime,
+    components,
+    activityComponents,
+    installStyles,
+    StandaloneWorkspace,
+    TAB_IDS,
+    // Also on the module surface directly, so a caller needs one require and one
+    // property read. Materialising `ssh.session.activity` here is safe: its factory
+    // only defines functions (every `SSH.require` inside it is lazy).
+    ...activityComponents(),
+  }
 })

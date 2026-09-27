@@ -190,3 +190,45 @@ host 实收：
   扩展（文档明确允许），**不是文件损坏**；校验时需容忍该 tag。
 - 临时诊断面包屑（`module-eval.json` / `host-ready.json` / `client-transport.json`）保留至 M1
   接线加固完成，M2 起移除。
+
+---
+
+## 8. 补充（2026-09-27）：§7.3「宿主侧热更新语义未确认」**已结案**
+
+§7.3 当年记录的是"端点**行为**看起来跟随了新代码，但 `host-ready.json` / `module-eval.json` 面包屑**始终没有出现**"，并把结论留成"待确认（host 可能不是通过重跑 `apply()` 更新，而是端点解析时重新读取模块/源码）"。
+
+今天用**可复现的数字**查清了这件事 —— **结论与当年的猜测不同**。
+
+### 8.1 测到了什么
+
+| 观察对象 | 数字 | 取值方式 |
+|---|---|---|
+| 构建产物 `lib/service.js` | **44** 个 Remote 方法（含 `followActivity`/`clearActivity`） | 构造内建类实例后调 `remoteMethods(instance)` |
+| 活着的 host 写的 `host-ready.json`（`at: 2026-09-27T04:44:42.447Z`，**在一次完整的 `plugin_manager` toggle 之后**） | **42** 个，**恰好缺** `followActivity`/`clearActivity` | 该文件由 `src/index.ts` 的 `recordHostReady()` 在每次 `apply()` 时写入 |
+
+即：**重建的 host 半边没有进入运行中的 GUI**。那次完整 toggle 的结果是 `application: "applied"`，说明 `apply()` **确实重跑过**；但它重跑用的是**已缓存的旧模块**。所以当年"端点行为跟随新代码"的观察，更可能来自当时端点解析路径上的其它变量（含 §7.2 的富参数丢字段），**不是**"模块被重新导入"。
+
+### 8.2 根因（与 §7.3 的猜测无关：是监视根本没生效）
+
+shipped `hmr` 行的 `ignored` 默认值为 `['**/node_modules', '**/.*', 'cache', 'data']`，而监视谓词比较的是 `relative(baseDir, path)`，其中 `baseDir` 是 **profile 目录**、监视根却是它的**兄弟**目录（`…\.dsh\plugins\dsh-ssh`）。于是 Windows 上的相对路径形如
+
+```
+..\..\plugins\dsh-ssh\lib\service.js
+```
+
+picomatch **不把 `\` 当分隔符** ⇒ 整串是"一段以 `.` 开头的路径" ⇒ 被 `**/.*` 命中 ⇒ **整棵树被忽略**，重建 `lib/**` **不产生任何 reload 事件**。
+
+三条对照测量（正斜杠同路径**不**被忽略；profile 内的 `node_modules/x.js` 被忽略 ⇒ 默认值本身是好的）见 `docs/ACCEPTANCE.md` §13.2 与 `docs/TESTING.md` §2.5。修复已写进 `scripts/profile-install.mjs` 的 `hmrBlock()`：把监视根**直接指向三个源码树**并 `ignored: []`（独立托管块 `# >>> dsh-ssh hmr watch >>>`）。
+
+### 8.3 对 §7.3 那条"给子代理的含义"的修正（更强，不是推翻）
+
+§7.3 的结论"**不要假设改完 `src/**` 就一定生效**"**依然正确，而且更强**：
+
+- 本机（Windows）上 **host 半边不会热更新**；**要生效必须重启 DSH**。
+- toggle `include:dsh-ssh` 行只让 Loader 用**已缓存的模块**重跑一次 `apply()`，**模块字节不会重新导入** —— 因此它能生效的只有**配置值**变更（`apply()` 会重新读取 profile patch），不能生效的是**代码**变更。
+- dev loop 的判据从"看面包屑有没有出现"升级为 **看 `host-ready.json` 的 `remoteMethods` 数字**：它能区分"`apply()` 没跑"与"`apply()` 跑了但用的是旧模块"，而 console / 日志做不到。
+- 相应纪律已写进 `docs/TESTING.md` §2.5 与 §7 第 8 条、`README.md` 的 FAQ、以及 `src/index.ts` 头部（写给下一位维护者）。
+
+### 8.4 仍待确认的一项（如实）
+
+`hmrBlock()` 写进 profile 的修复**尚未在"重启后的 host"上验证过**：改 profile patch 不会重载已加载的 `hmr` 行，所以本次运行实例仍是 42 方法集。**下一次 DSH 重启后的判据**：改一处 `src/**` → 重建 → 若 `host-ready.json` 的方法数/字段随之变化，则本机热更新恢复；若仍不变，则需继续排查（此时 `ignored: []` 已排除，怀疑方向应转向"该行是否真的被重新装载"）。

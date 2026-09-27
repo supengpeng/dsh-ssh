@@ -20,8 +20,10 @@
 
 import type { JsonSchemaNode, ToolCallView, ToolDefinition, ToolResult, ToolResultView } from '@deepseek-ai/dsh-tools'
 
-import { SshError } from '../protocol.js'
+import { SshError, type ActivityStatus, type Frame } from '../protocol.js'
+import type { ActivityFeed } from '../activity/feed.js'
 import type { ExecRunResult } from '../exec/exec.js'
+import { beginActivity, finishActivity, mirrorExecFrame, noteOf, recordActivity, targetOf } from './activity.js'
 import {
   arrayNode,
   booleanNode,
@@ -44,6 +46,15 @@ export const SSH_EXEC_TOOL_NAME = 'ssh_exec'
 /** The only surface the tool needs from the plugin. */
 export interface SshExecToolDeps {
   exec: ExecService
+  /**
+   * The agent-activity mirror (ICD §4.7).
+   *
+   * Optional because the mirror is an observation, not a dependency: a composition
+   * built without one (or a unit double older than the subsystem) must still run
+   * commands. Recording here is what makes the model's work visible in the 终端 tab
+   * — including the calls it was refused — and it can never change the envelope.
+   */
+  activity?: ActivityFeed
   /** Called once per finished call, for the audit log (SP4 owns the auditor). */
   onResult?: (event: {
     sessionId: string | null
@@ -140,13 +151,18 @@ export function sshExecTool(deps: SshExecToolDeps): ToolDefinition {
       const label = args.label
 
       if (errors.length > 0) {
-        return refusal({
+        const envelope = refusal({
           code: 'SSH_CFG_INVALID',
           message: `invalid arguments: ${errors.join('; ')}`,
           command: args.command ?? '',
           cwd: args.cwd ?? null,
           notes: label !== undefined ? [`label: ${label}`] : [],
         })
+        // Refusals are mirrored too: the user watching the panel wants to see what
+        // the model *tried*, and a call the tool declined is exactly the part of the
+        // session a successful-looking result would hide.
+        recordRefusal(deps, envelope, label ?? null)
+        return envelope
       }
 
       let sessionId: string
@@ -154,18 +170,33 @@ export function sshExecTool(deps: SshExecToolDeps): ToolDefinition {
         sessionId = deps.exec.resolveTargetSession(args.sessionId)
       } catch (error) {
         const info = toErrorInfoSafe(error)
-        return refusal({
+        const envelope = refusal({
           code: info.code,
           message: info.message,
           command: args.command ?? '',
           cwd: args.cwd ?? null,
           notes: sessionNotes(deps, info.details),
         })
+        recordRefusal(deps, envelope, label ?? null)
+        return envelope
       }
 
       const notes: string[] = []
       if (label !== undefined) notes.push(`label: ${label}`)
       notes.push(`host: ${describeSession(deps, sessionId)}`)
+
+      // The mirror (ICD §4.7) is opened once the session is resolved, so the record
+      // can carry the target a reader needs to tell two hosts apart. Every exit path
+      // below closes it: live output is attached while the command runs, and the
+      // outcome when it ends.
+      const activity = beginActivity(deps.activity, {
+        kind: 'exec',
+        subject: args.command ?? '',
+        sessionId,
+        target: sessionTarget(deps, sessionId),
+        cwd: args.cwd ?? null,
+        label: label ?? null,
+      })
 
       let result: ExecRunResult
       try {
@@ -181,6 +212,10 @@ export function sshExecTool(deps: SshExecToolDeps): ToolDefinition {
           {
             ...(args.stdin !== undefined ? { stdin: args.stdin } : {}),
             signal: exec.signal,
+            // Live frames, not a re-read of the capture: `execWait` returns only when
+            // the command is over, so this is the single moment at which a reader can
+            // watch a long command print.
+            ...(activity === undefined ? {} : { onFrame: (frame: Frame) => mirrorExecFrame(activity, frame) }),
             ...(args.pty === true
               ? {
                   pty: true,
@@ -192,6 +227,11 @@ export function sshExecTool(deps: SshExecToolDeps): ToolDefinition {
         )
       } catch (error) {
         const info = toErrorInfoSafe(error)
+        // A command that never started is a refusal in the record too, and the handle
+        // must be closed here: a `running` record is the one the feed never evicts.
+        // An explicit `sessionId` the service cannot resolve fails at this point, so
+        // the notes the envelope carries (the label, the host) are mirrored as well.
+        finishActivity(activity, { status: 'refused', code: info.code, note: noteOf(info.message, ...notes) })
         return refusal({
           code: info.code,
           message: info.message,
@@ -251,6 +291,19 @@ export function sshExecTool(deps: SshExecToolDeps): ToolDefinition {
         bytes: { stdout: result.bytes.stdout, stderr: result.bytes.stderr },
         binary: { stdout: result.binary.stdout, stderr: result.binary.stderr },
         notes,
+      })
+
+      // The record's terminal fields mirror the envelope the model receives, so the
+      // panel and the tool result can never disagree about what happened. `truncated`
+      // is the one flag that is ORed in: a head+tail capture is worth flagging even
+      // when the mirror itself dropped nothing.
+      finishActivity(activity, {
+        status: statusOfExecOutcome(outcome),
+        exitCode: envelope.exitCode,
+        signal: envelope.signal,
+        code: envelope.code,
+        note: execNote(outcome, envelope),
+        truncated,
       })
 
       try {
@@ -575,6 +628,71 @@ function describeSession(deps: SshExecToolDeps, sessionId: string): string {
   if (session === undefined) return sessionId
   const target = [session.user, session.host].filter((part): part is string => typeof part === 'string' && part.length > 0).join('@')
   return target.length > 0 ? `${sessionId} (${target})` : sessionId
+}
+
+// ── the activity mirror (ICD §4.7) ──────────────────────────────────────────
+
+/**
+ * Mirror a refusal: one complete record for a call that never reached the remote
+ * host.
+ *
+ * Written from the envelope rather than from the arguments, so the record and the
+ * model-visible answer can never disagree about why the call was declined. `label`
+ * is passed separately because the envelope only carries it inside its notes.
+ */
+function recordRefusal(deps: SshExecToolDeps, envelope: SshExecEnvelope, label: string | null): void {
+  recordActivity(
+    deps.activity,
+    {
+      kind: 'exec',
+      subject: envelope.command,
+      sessionId: envelope.sessionId,
+      target: sessionTarget(deps, envelope.sessionId),
+      cwd: envelope.cwd,
+      label,
+    },
+    { status: 'refused', code: envelope.code, note: noteOf(envelope.message, ...envelope.notes) },
+  )
+}
+
+/** The feed's terminal class for a command outcome. `output-limit` is still `ok`. */
+function statusOfExecOutcome(outcome: ExecOutcome): ActivityStatus {
+  switch (outcome) {
+    case 'success':
+    case 'output-limit':
+      return 'ok'
+    case 'timeout':
+      return 'timeout'
+    case 'cancelled':
+      return 'cancelled'
+    case 'refused':
+      return 'refused'
+    default:
+      return 'error'
+  }
+}
+
+/**
+ * The one-line note a finished record carries: how the command ended, then the
+ * envelope's own notes.
+ *
+ * A failure leads with its message (the code is a separate field on the record); a
+ * success leads with its exit status, because "exit 0" is the fact that tells a
+ * reader the output below it is the whole story.
+ */
+function execNote(outcome: ExecOutcome, envelope: SshExecEnvelope): string | null {
+  const head =
+    outcome === 'success' || outcome === 'output-limit'
+      ? `exit ${envelope.exitCode ?? 'n/a'}${envelope.signal === null ? '' : ` (${envelope.signal})`}`
+      : envelope.message
+  return noteOf(head, ...envelope.notes)
+}
+
+/** `user@host` of a session the service can still describe, for the record's target. */
+function sessionTarget(deps: SshExecToolDeps, sessionId: string | null): string | null {
+  if (sessionId === null) return null
+  const session = deps.exec.sessions().find((candidate) => candidate.id === sessionId)
+  return session === undefined ? null : targetOf(session.user, session.host)
 }
 
 /** First line of the command, for the pending card title. */

@@ -29,13 +29,24 @@
 import type { JsonSchemaNode, ToolDefinition } from '@deepseek-ai/dsh-tools'
 
 import { toErrorInfo, type SessionInfo } from '../protocol.js'
+import type { ActivityFeed } from '../activity/feed.js'
 import { booleanNode, integerNode, lines, objectNode, parameterRoot, stringNode, text, toLossless, type JsonValue } from '../exec/schema.js'
+import { beginActivity, finishActivity, noteOf, recordActivity, statusOfCode, targetOf } from './activity.js'
 
 export const SESSIONS_TOOL_NAMES = ['ssh_connect', 'ssh_disconnect', 'ssh_sessions'] as const
 export type SessionsToolName = (typeof SESSIONS_TOOL_NAMES)[number]
 
 /** What the tools need from the plugin; injected so this file imports no module. */
 export interface SessionsToolDeps {
+  /**
+   * The agent-activity mirror (ICD §4.7).
+   *
+   * Optional because the mirror is an observation, not a dependency (the Lead's
+   * composition always supplies one): when it is absent these tools behave exactly
+   * as they did before, and when it is present each call — refusals included — is
+   * recorded for the panel's 终端 tab.
+   */
+  activity?: ActivityFeed
   /** `registry.list()` — the same projection the UI and `sshPlugin/listSessions` read. */
   listSessions(): SessionInfo[]
   /**
@@ -87,6 +98,42 @@ interface SessionsEnvelope {
   }>
 }
 
+/**
+ * One entry of `ssh_sessions`, declared field by field on purpose.
+ *
+ * The declared shape is not documentation: the Host validates the real value against
+ * it, and an empty `objectNode({})` is a *closed* object node — no declared
+ * properties, `additionalProperties: false` — so every real session was rejected with
+ * `"value.sessions[0].sessionId" is not a declared property` and the model was told
+ * "tool returned invalid output" for a call that had actually succeeded.
+ *
+ * `rttMs` is the one genuinely optional field: the projection omits it until the
+ * connection has been measured, so it must not be required.
+ */
+const sessionItemSchema = objectNode(
+  {
+    sessionId: stringNode('Session handle for the other ssh_* tools.'),
+    label: stringNode('Display name of the session.'),
+    host: stringNode('Remote host.'),
+    port: integerNode('Remote port.'),
+    user: stringNode('Remote user.'),
+    state: stringNode('Session state.'),
+    since: stringNode('ISO-8601 timestamp the session was established.'),
+    connectedForMs: integerNode('Milliseconds the session has been connected.'),
+    rttMs: { type: 'number', description: 'Round-trip time in milliseconds; omitted until it has been measured.' },
+    bytesIn: integerNode('Bytes received from the remote host.'),
+    bytesOut: integerNode('Bytes sent to the remote host.'),
+    capabilities: objectNode(
+      {
+        shell: booleanNode('The session offers a shell channel.'),
+        sftp: booleanNode('The session offers an SFTP channel.'),
+      },
+      ['shell', 'sftp'],
+    ),
+  },
+  ['sessionId', 'label', 'host', 'port', 'user', 'state', 'since', 'connectedForMs', 'bytesIn', 'bytesOut', 'capabilities'],
+)
+
 const ENVELOPE_SCHEMA: JsonSchemaNode = objectNode(
   {
     ok: { type: 'boolean', description: 'Whether the call succeeded.' },
@@ -102,7 +149,7 @@ const ENVELOPE_SCHEMA: JsonSchemaNode = objectNode(
       shell: { type: 'boolean' },
       sftp: { type: 'boolean' },
     }),
-    sessions: { type: 'array', items: objectNode({}) },
+    sessions: { type: 'array', description: 'Connected sessions, in the order the registry holds them.', items: sessionItemSchema },
   },
   ['ok'],
 )
@@ -220,6 +267,13 @@ export function sshSessionsTool(deps: SessionsToolDeps, now: () => number = Date
     isConcurrencySafe: () => true,
     async execute(): Promise<unknown> {
       const sessions = deps.listSessions().map((info) => sessionSummary(info, now()))
+      // A listing is one summary operation, not a transcript: the record is opened and
+      // closed in the same call, and its one line is the answer to "what is connected".
+      const summary =
+        sessions.length === 0
+          ? 'no session is connected'
+          : `${sessions.length} connected: ${sessions.map((session) => session.sessionId).join(', ')}`
+      recordActivity(deps.activity, { kind: 'sessions', subject: 'ssh_sessions' }, { status: 'ok', note: summary, text: summary })
       const envelope: SessionsEnvelope = {
         ok: true,
         notes:
@@ -265,21 +319,31 @@ export function sshConnectTool(deps: SessionsToolDeps): ToolDefinition {
       const args = asRecord(rawArgs)
       const profileId = readString(args, 'profileId')
       const host = readString(args, 'host')
+      const user = readString(args, 'user')
       const notes: string[] = []
+      // Opened before the connection is attempted, so a connect that hangs or is
+      // refused is visible while it happens — the model's failed attempts are exactly
+      // what a result-only view of the session never shows.
+      const activity = beginActivity(deps.activity, {
+        kind: 'connect',
+        subject: profileId ?? targetOf(user, host) ?? host ?? 'ssh_connect',
+        target: host === undefined ? profileTarget(deps, profileId) : targetOf(user, host),
+      })
       if (profileId === undefined && host === undefined) {
-        return toLossless({
+        const value = toLossless({
           ok: false,
           code: 'SSH_CFG_INVALID',
           message: 'provide profileId, or a host for an inline connection',
           notes: profilesHint(deps),
         } satisfies SessionsEnvelope)
+        finishActivity(activity, { status: 'refused', code: value.code, note: noteOf(value.message, ...value.notes) })
+        return value
       }
 
       const inline: Record<string, unknown> = {}
       if (host !== undefined) inline['host'] = host
       const port = readNumber(args, 'port')
       if (port !== undefined) inline['port'] = port
-      const user = readString(args, 'user')
       if (user !== undefined) inline['user'] = user
       const auth = readString(args, 'auth')
       if (auth !== undefined) inline['auth'] = auth
@@ -305,6 +369,10 @@ export function sshConnectTool(deps: SessionsToolDeps): ToolDefinition {
         const session = result.session
         if (profileId !== undefined) notes.push(`profile: ${profileId}`)
         notes.push(`host key policy: ${deps.hostKeyPolicy}`)
+        finishActivity(activity, {
+          status: 'ok',
+          note: `connected ${session.id} as ${session.user}@${session.host}:${session.port}`,
+        })
         return toLossless({
           ok: true,
           notes,
@@ -316,7 +384,13 @@ export function sshConnectTool(deps: SessionsToolDeps): ToolDefinition {
           capabilities: { shell: session.capabilities.shell, sftp: session.capabilities.sftp },
         } satisfies SessionsEnvelope)
       } catch (error) {
-        return toLossless(refusal(error, deps, notes))
+        const value = toLossless(refusal(error, deps, notes))
+        finishActivity(activity, {
+          status: statusOfCode(value.code),
+          code: value.code,
+          note: noteOf(value.message, ...value.notes),
+        })
+        return value
       }
     },
   }
@@ -340,17 +414,26 @@ export function sshDisconnectTool(deps: SessionsToolDeps): ToolDefinition {
     async execute(rawArgs: unknown): Promise<unknown> {
       const args = asRecord(rawArgs)
       const sessionId = readString(args, 'sessionId')
+      const activity = beginActivity(deps.activity, {
+        kind: 'disconnect',
+        subject: sessionId ?? 'ssh_disconnect',
+        sessionId: sessionId ?? null,
+        target: sessionTarget(deps, sessionId ?? null),
+      })
       if (sessionId === undefined) {
-        return toLossless({
+        const value = toLossless({
           ok: false,
           code: 'SSH_CFG_INVALID',
           message: 'sessionId is required',
           notes: deps.listSessions().map((info) => `${info.id}: ${info.user}@${info.host}`),
         } satisfies SessionsEnvelope)
+        finishActivity(activity, { status: 'refused', code: value.code, note: noteOf(value.message, ...value.notes) })
+        return value
       }
       try {
         const force = args['force'] === true
         const result = await deps.disconnect(sessionId, force)
+        finishActivity(activity, { status: 'ok', note: `closed ${sessionId}${force ? ' (forced)' : ''}` })
         return toLossless({
           ok: true,
           notes: [`closed ${sessionId}${force ? ' (forced)' : ''}`],
@@ -361,7 +444,13 @@ export function sshDisconnectTool(deps: SessionsToolDeps): ToolDefinition {
           state: 'closed',
         } satisfies SessionsEnvelope)
       } catch (error) {
-        return toLossless(refusal(error, deps))
+        const value = toLossless(refusal(error, deps))
+        finishActivity(activity, {
+          status: statusOfCode(value.code),
+          code: value.code,
+          note: noteOf(value.message, ...value.notes),
+        })
+        return value
       }
     },
   }
@@ -387,4 +476,26 @@ function profilesHint(deps: SessionsToolDeps): string[] {
   const profiles = deps.listProfiles?.() ?? []
   if (profiles.length === 0) return ['no stored profile exists yet; create one in the SSH panel, or pass host/user/auth']
   return profiles.slice(0, 10).map((profile) => `${profile.id}: ${profile.name} (${profile.user}@${profile.host})`)
+}
+
+// ── the activity mirror (ICD §4.7) ──────────────────────────────────────────
+
+/** `user@host` of a session the registry still lists, for the record's target line. */
+function sessionTarget(deps: SessionsToolDeps, sessionId: string | null): string | null {
+  if (sessionId === null) return null
+  const session = deps.listSessions().find((candidate) => candidate.id === sessionId)
+  return session === undefined ? null : targetOf(session.user, session.host)
+}
+
+/**
+ * `user@host` of a stored profile.
+ *
+ * A `connect` names a profile rather than a host, so this is the only way the record
+ * can show the reader *which* host the model was reaching for before the session
+ * exists. An unknown profile resolves to null rather than to a guess.
+ */
+function profileTarget(deps: SessionsToolDeps, profileId: string | undefined): string | null {
+  if (profileId === undefined) return null
+  const profile = deps.listProfiles?.().find((candidate) => candidate.id === profileId)
+  return profile === undefined ? null : targetOf(profile.user, profile.host)
 }

@@ -6,7 +6,7 @@
  * object owns the implementations, grouped by ICD section:
  *
  *     profiles  §4.2      sessions  §4.3      exec  §4.4
- *     files     §4.5      audit     §4.6      getConfig §4.1
+ *     files     §4.5      audit     §4.6      activity §4.7     getConfig §4.1
  *
  * The split is deliberate: it keeps the wire table a thin, auditable list of
  * "decode → delegate → encode" methods, and it lets an endpoint test drive a group
@@ -14,6 +14,7 @@
  * `src/api/params.ts`.
  */
 import { type PublicConfig } from '../config.js';
+import { ActivityApi } from './activity-api.js';
 import { AuditApi } from './audit-api.js';
 import { ExecApi } from './exec-api.js';
 import { FilesApi } from './files-api.js';
@@ -26,6 +27,7 @@ export declare class LocalApi {
     readonly exec: ExecApi;
     readonly files: FilesApi;
     readonly audit: AuditApi;
+    readonly activity: ActivityApi;
     /** Kept for diagnostics and for the tools layer; never handed to the wire. */
     readonly deps: ApiDeps;
     constructor(deps: ApiDeps);

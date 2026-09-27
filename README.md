@@ -50,6 +50,10 @@ node scripts/profile-install.mjs --uninstall
 | `secrets.provider` / `envPrefix` | `credentials` / `DSH_SSH_` | 凭据来源；环境变量优先级最高且**只读** |
 | `logging.redact` / `redactKeys` | `true` / `[…]` | 三层脱敏中的日志层 |
 | `maxOutputBytes` | `262144` | 单命令输出上限（超限保留头尾并置 `truncated`） |
+| `activity.enabled` | `true` | 是否记录 agent 经 `ssh_*` 工具做的事（「终端」标签的活动镜像，ICD §4.7） |
+| `activity.maxRecords` | `200` | 镜像保留的记录条数（环满先丢最老的**已结束**记录，运行中的不淘汰） |
+| `activity.maxRecordBytes` | `65536` | 单条记录的文本上限（超出丢尾部并置 `truncated`） |
+| `activity.maxTotalBytes` | `1048576` | 整个镜像的文本上限 |
 | `ui.defaultWidthPx` / `terminalFontSize` | `420` / `13` | 侧栏宽度与终端字号 |
 
 **凭据**永远不落配置文件：密码/passphrase 走 `ctx.credentials`，或用一次性内存凭据（`connect` 的 `secrets`），或 `DSH_SSH_<PROFILE_SLUG>_PASSWORD` 环境变量（只读、UI 显示 `source:'env'`）。UI 与日志中只会出现固定 8 个圆点的掩码。
@@ -65,7 +69,10 @@ node scripts/profile-install.mjs --uninstall
 2. **新建连接**（`Ctrl/Cmd+T`）：填 名称 / 主机 / 端口 / 用户 / 认证方式；测试连接（`conn.test`）会显示延迟、服务端 banner 与主机密钥指纹。
 3. 首次连接：策略为 `strict` 时弹指纹确认；`accept-new` 自动记住到 `known_hosts`；指纹变化一定触发二次确认（`SSH_HOSTKEY_MISMATCH`）。
 4. 连接后进入**会话工作区**，四个标签：
-   - **终端**：真 PTY，跑 `top`/`vim` 等全屏程序正常，支持复制粘贴、清屏、字号、重连；
+   - **终端**：真 PTY，跑 `top`/`vim` 等全屏程序正常，支持复制粘贴、清屏、字号、重连。这个标签有**两面**，用标签内的一行切换：
+     - **终端**：交互式 PTY —— **你**的会话；
+     - **AI 活动**：**镜像模型经 `ssh_*` 工具做过什么** —— 命令与其实时 stdout/stderr、上传/下载、列目录、连接/断开，每条带主机、状态、退出码与耗时；模型在**另一台**主机上干活时这里也看得见。切换器上的圆点是未读计数，每条记录可一键复制。
+     - 跟随规则：有活动的会话**直接开在活动面**；新活动**自动切过去**，除非你正在终端里打字、或你自己选过面（显式选择不再被自动覆盖）。
    - **命令**：单命令 stdout/stderr/退出码/耗时，历史上下翻；
    - **文件**：远端目录浏览、上传/下载（进度、断点续传、校验）、新建/重命名/删除/chmod；
    - **日志**：本会话审计（脱敏后），可导出。
@@ -74,7 +81,19 @@ node scripts/profile-install.mjs --uninstall
 
 ## 4. Agent 工具
 
-`allowAgentTools: true`（默认）时向模型暴露：`ssh_exec`、`ssh_upload`、`ssh_download`、`ssh_list_dir`、`ssh_sessions`。工具名与 `cordis.patch.yml` 的 `tools` 列表一致（单测断言两者相等）。
+`allowAgentTools: true`（默认）时向模型暴露 **7 个**工具：`ssh_connect`、`ssh_disconnect`、`ssh_sessions`、`ssh_exec`、`ssh_upload`、`ssh_download`、`ssh_list_dir`。工具名与 `cordis.patch.yml` 的 `tools` 列表一致（单测断言两者相等），也与 `dsh.plugin.json` 一致。
+
+### 4.1 模型做的事在面板里看得见（agent 活动镜像，ICD §4.7）
+
+工具调用发生在 **host 侧**，不经过浏览器，所以模型干活时面板本来是看不到的。现在每次工具调用都由 host 记进一个有界的**活动镜像**，在「终端」标签的 **AI 活动** 面按时间列出：命令及其**实时** stdout/stderr、上传/下载（含进度行）、列目录、连接/断开/列会话；每条记录带主机（`user@host`）、状态、退出码、耗时与失败码，可一键复制整条。
+
+- **端点**：`sshPlugin/followActivity`（流，**无参数** —— 镜像是全局的，每条记录自带 `sessionId`，所以另一台主机上的工作也不会被藏起来）与 `sshPlugin/clearActivity`（清全局历史）。
+- **边界**（刻意如此）：镜像是**视图不是日志** —— 只在内存里保留最近若干条（`activity.*`），**不落盘、不脱敏、不承诺跨重载或重启存活**；要事后追查请读**审计文件**（`queryAudit`，脱敏后 JSONL 落盘）。镜像持有的正是你自己会话的输出，所以命令打印的密钥也会显示在这里 —— 这是与审计文件的**有意**区别（ICD §12 R10）。
+- **关闭**：`activity.enabled: false` 时整体不记录（零事件、空快照），工具行为不变。
+
+### 4.2 会话里的 `ssh_exec` 也是一张终端卡片
+
+同一次调用在**会话流**里显示为终端卡片：`$ <命令>`、按 host 的 `[stderr]` 标记分节的输出、退出码或信号徽标，以及 outcome / 耗时 / streamId 等事实行。这不是 DSH 自动给的：Web 客户端**不消费** host 的 `presentCall`/`presentResult` 视图，而是按 **wire 工具名**分派键控槽位 `tool.call.toolview`，未注册就落回通用行（`Tool call · ssh_exec · <第一个字符串参数>` 加 Input/Output 文本）。插件因此在自己的 client 半边注册了 `key: 'ssh_exec'`（`client/src/session/toolview.js`）。
 
 ## 5. FAQ
 
@@ -83,8 +102,10 @@ node scripts/profile-install.mjs --uninstall
 
 **Q. 改了代码但界面没变？**
 - 改 `client/src/**` → `node scripts/build-client.mjs`；**只有 `lib/client.js` 字节变化时页面才会重新 apply()**。
-- 改 `src/**`（host）→ 需要 toggle `include:dsh-ssh` 行（`plugin_manager` 关再开）以重跑 `apply()`。本会话禁止重启 DSH。
-- 改配置值 → 同样需要 toggle 行。
+- 改 `src/**`（host 半边）→ **本机（Windows）无法热更新**：`lib/**` 重建后不会产生任何 reload 事件，toggle `include:dsh-ssh` 行也只是让**已缓存**的模块重跑一次 `apply()`，新代码进不来。**要生效必须重启 DSH。**
+- 改**配置值**（profile 的 `cordis.patch.yml`）→ toggle 行即可：`apply()` 会用新配置重跑；这与"模块代码是否重新加载"是两件事。
+- 判据（不要再靠猜）：host 每次 `apply()` 都写 `<DSH_HOME>\logs\dsh-ssh\host-ready.json`，里面是**这个活着的实例实际注册的** `remoteMethods` 列表 —— 方法数没变，就是新代码没进来。
+- 实测证据与根因（`hmr` 行的 `ignored` 默认值在 Windows 上把整棵监视树都忽略掉）见 `docs/ACCEPTANCE.md` §13 与 `docs/TESTING.md` §2.5。
 
 **Q. `pnpm install` 报 `cpu-features` 构建被跳过？**
 非致命：`ssh2` 自动回退纯 JS 加密。本机实测仍有 30 MiB/s 上传、20 MiB/s 下载（`docs/TESTING.md` 有实测数字）。

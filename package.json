@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-ssh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "SSH plugin for DSH: connection management, command execution, SFTP transfer, and a right-sidebar session workspace.",
   "type": "module",

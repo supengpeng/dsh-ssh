@@ -18,12 +18,22 @@
  *     the captured output.
  */
 import type { JsonSchemaNode, ToolDefinition } from '@deepseek-ai/dsh-tools';
+import type { ActivityFeed } from '../activity/feed.js';
 import { type JsonValue, type TextBlock } from '../exec/schema.js';
 import type { ExecService } from '../exec/service.js';
 export declare const SSH_EXEC_TOOL_NAME = "ssh_exec";
 /** The only surface the tool needs from the plugin. */
 export interface SshExecToolDeps {
     exec: ExecService;
+    /**
+     * The agent-activity mirror (ICD §4.7).
+     *
+     * Optional because the mirror is an observation, not a dependency: a composition
+     * built without one (or a unit double older than the subsystem) must still run
+     * commands. Recording here is what makes the model's work visible in the 终端 tab
+     * — including the calls it was refused — and it can never change the envelope.
+     */
+    activity?: ActivityFeed;
     /** Called once per finished call, for the audit log (SP4 owns the auditor). */
     onResult?: (event: {
         sessionId: string | null;

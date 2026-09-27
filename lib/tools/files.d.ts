@@ -25,6 +25,7 @@
  */
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { SessionInfo } from '../protocol.js';
+import type { ActivityFeed } from '../activity/feed.js';
 import type { DirEntry, FileInfo, TransferEngineDefaults, TransferLogger, TransferOutcome, TransferProgress, TransferVerify } from '../sftp/index.js';
 /** Tool names, in the order they are registered (ICD §0). */
 export declare const FILES_TOOL_NAMES: readonly ["ssh_upload", "ssh_download", "ssh_list_dir"];
@@ -50,6 +51,15 @@ export interface TransferToolRequest {
  * doubles — no SSH connection, no filesystem.
  */
 export interface FilesToolDeps {
+    /**
+     * The agent-activity mirror (ICD §4.7).
+     *
+     * Optional because the mirror is an observation, not a dependency: a composition
+     * built without one (or a unit double older than the subsystem) must still
+     * transfer files. When present, every call is recorded — progress lines included —
+     * and the tool result is unaffected either way.
+     */
+    activity?: ActivityFeed;
     /** Structured logger; progress lines land here. */
     log?: TransferLogger;
     /** `sftp.*` defaults, purely informational for the description text. */

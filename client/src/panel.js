@@ -19,7 +19,7 @@
  */
 
 SSH.define('ssh.panel', function (SSH) {
-  const { useState, useEffect, useCallback } = SSH.react
+  const { useState, useEffect, useCallback, useRef } = SSH.react
   const h = SSH.h
   const core = () => SSH.require('ssh.core')
 
@@ -38,6 +38,23 @@ SSH.define('ssh.panel', function (SSH) {
   const conn = () => SSH.require('ssh.conn')
   const sessionRuntime = () => SSH.require('ssh.session.runtime')
   const sessionUi = () => SSH.require('ssh.session.ui')
+
+  /**
+   * The agent-activity module (ICD §4.7), or `null`.
+   *
+   * Tolerated rather than required: a page that is still running a bundle from
+   * before this module existed (or one where the module failed to materialise)
+   * must keep its terminal tab, not lose the whole session view to a `require`
+   * that throws.
+   */
+  function sessionActivity() {
+    try {
+      return SSH.require('ssh.session.activity')
+    } catch (error) {
+      console.warn('[dsh-ssh] the activity module is unavailable', error && error.message)
+      return null
+    }
+  }
 
   /**
    * The one font-size controller of this client run.
@@ -99,6 +116,9 @@ SSH.define('ssh.panel', function (SSH) {
 .dsh-ssh-session-body { flex:1 1 auto; min-height:0; display:flex; flex-direction:column; overflow:hidden; }
 /* The panel that owns the viewport is the only thing allowed to grow. */
 .dsh-ssh-session-body > * { flex:1 1 auto; min-height:0; }
+/* …except the 终端 / AI 活动 switch, which is chrome and must keep its own height. */
+.dsh-ssh-session-body > .dsh-ssh-term-switch-row { flex:0 0 auto; min-height:0;
+  padding:6px 8px 0; border-bottom:1px solid var(--dsw-alias-border-l1); }
 .dsh-ssh-session-status { flex:0 0 auto; max-height:calc(2 * 1.6em + 10px); overflow:hidden;
   border-top:1px solid var(--dsw-alias-border-l1); }
 .dsh-ssh-session-status .dsh-ssh-statusbar { display:flex; flex-wrap:wrap; align-items:center; gap:2px 8px; padding:4px 8px; }
@@ -114,6 +134,14 @@ SSH.define('ssh.panel', function (SSH) {
     if (disposeLayoutCss) return
     disposeLayoutCss = SSH.style.insert(LAYOUT_CSS)
   }
+
+  /**
+   * "No agent activity", in the shape `ssh.session.activity` reports a summary.
+   *
+   * Frozen and shared so the summary below is always an object: the switch reads
+   * it on every render, and a `null` would have to be guarded at each use site.
+   */
+  const EMPTY_ACTIVITY_SUMMARY = Object.freeze({ total: 0, running: 0, unread: 0, newestAt: 0, all: { total: 0, running: 0, unread: 0 } })
 
   // ── M0 diagnostics (unchanged surface, now behind `panel.view === 'debug'`) ──
 
@@ -286,6 +314,19 @@ SSH.define('ssh.panel', function (SSH) {
    * The shell stream is opened by the container — not by `TerminalTab` — because the
    * stream belongs to the session, not to the tab that happens to be visible: a user
    * who switches to the file manager must not lose the terminal's scrollback.
+   *
+   * The 终端 tab has two faces: the interactive PTY and the mirror of what the model
+   * did through the `ssh_*` tools (ICD §4.7). The mirror exists because the agent's
+   * commands never travel through this client — before it, a user watching the
+   * terminal while the model worked saw an empty screen, and afterwards had no way to
+   * find out what had run. The switch is therefore *inside* the tab rather than a
+   * fifth tab, and it follows the agent on its own:
+   *
+   *   - a session with activity opens on the mirror, so the tab is never a blank
+   *     shell pretending nothing happened;
+   *   - new activity switches to it, unless the user is typing into the PTY (the
+   *     one case where an automatic switch would fight the user) or has picked a
+   *     face themselves (an explicit choice is never overridden).
    */
   function SessionView(props) {
     const { sessionId, onOpenHelp } = props
@@ -300,8 +341,61 @@ SSH.define('ssh.panel', function (SSH) {
     const [shellLocalId, setShellLocalId] = useState(null)
     const [history, setHistory] = useState([])
     const [exec, setExec] = useState({ running: false, result: null, localId: null })
+    const activity = sessionActivity()
+    // Read from the store, not from a first render: a panel reopened after the agent
+    // worked must land on the mirror even though the snapshot arrives asynchronously.
+    const [termFace, setTermFace] = useState(() => {
+      if (!activity) return 'terminal'
+      try {
+        return activity.activityStore.getRecords(sessionId).length > 0 ? 'activity' : 'terminal'
+      } catch {
+        return 'terminal'
+      }
+    })
+    const faceChosenByUser = useRef(false)
+    /**
+     * The activity module owns the subscription; this component only reads its
+     * summary. The hook is called through the module when it is present and
+     * replaced by a plain reader when it is not, so the hook order never depends on
+     * whether this bundle contains the module (an HMR'd page may not).
+     */
+    const summary = activity && typeof activity.useActivitySummary === 'function'
+      ? activity.useActivitySummary({ sessionId })
+      : EMPTY_ACTIVITY_SUMMARY
+    /**
+     * Primitive projections of the summary.
+     *
+     * The effect below must not depend on the summary *object*: the store hands out
+     * a fresh one per change, and depending on its identity would re-run the effect
+     * on every store notification — which, with `markActivitySeen()` inside, is how
+     * a polling loop starts. `unread` is global (the badge surfaces work the agent
+     * did on another host); the counts that decide the automatic switch are this
+     * session's, so a background host cannot steal the view.
+     */
+    const unread = (summary.all && typeof summary.all.unread === 'number' ? summary.all.unread : summary.unread) || 0
+    const activityCount = summary.total
+    const activityRunning = summary.running
 
     ensureLayoutStyles()
+
+    // Follow the agent while the interactive terminal is showing. The focus test is a
+    // DOM read at the decision point rather than a prop on `TerminalTab`: the terminal
+    // owns its own focus handling, and a stale boolean here would either switch away
+    // mid-keystroke or refuse to follow a genuinely idle user.
+    useEffect(() => {
+      if (!activity) return
+      if (active !== 'terminal') return
+      if (termFace === 'activity') {
+        // Only when there is something to mark: a store that notifies even on a
+        // no-op clear would otherwise re-enter this effect forever.
+        if (unread > 0) activity.markActivitySeen()
+        return
+      }
+      if (activityCount === 0 || faceChosenByUser.current) return
+      const focused = typeof document !== 'undefined' ? document.activeElement : null
+      if (focused && typeof focused.closest === 'function' && focused.closest('.ssh-ws-term')) return
+      setTermFace('activity')
+    }, [active, activity, activityCount, activityRunning, unread, termFace])
 
     useEffect(() => {
       if (!sessionId) return undefined
@@ -368,16 +462,39 @@ SSH.define('ssh.panel', function (SSH) {
 
     const body = () => {
       if (active === 'terminal') {
-        return h('div', { className: 'dsh-ssh-session-body' },
-          h(SSH.require('ssh.session.terminal').TerminalTab, {
-            sessionId,
-            streamId,
-            fontSize,
-            onFontSizeChange: (next) => controller.setSize(next),
-            // `streamId` here is the stream's *local* id, which is what
-            // `reconnectShell` resumes from (`sinceSeq`).
-            onReconnect: () => runtime.actions.reconnectShell({ sessionId, streamId: shellLocalId }),
-          }))
+        const terminal = h(SSH.require('ssh.session.terminal').TerminalTab, {
+          sessionId,
+          streamId,
+          fontSize,
+          onFontSizeChange: (next) => controller.setSize(next),
+          // `streamId` here is the stream's *local* id, which is what
+          // `reconnectShell` resumes from (`sinceSeq`).
+          onReconnect: () => runtime.actions.reconnectShell({ sessionId, streamId: shellLocalId }),
+        })
+        if (!activity || typeof activity.AgentActivitySwitch !== 'function') {
+          return h('div', { className: 'dsh-ssh-session-body' }, terminal)
+        }
+        return h(
+          'div',
+          { className: 'dsh-ssh-session-body' },
+          h(
+            'div',
+            { className: 'dsh-ssh-term-switch-row', 'data-testid': 'ssh-term-switch-row' },
+            h(activity.AgentActivitySwitch, {
+              mode: termFace,
+              onMode: (next) => {
+                // An explicit choice outranks the automatic follow for the rest of
+                // this session view's life.
+                faceChosenByUser.current = true
+                setTermFace(next)
+              },
+              summary,
+            }),
+          ),
+          termFace === 'activity' && typeof activity.AgentActivityPane === 'function'
+            ? h(activity.AgentActivityPane, { sessionId })
+            : terminal,
+        )
       }
       if (active === 'command') {
         return h('div', { className: 'dsh-ssh-session-body' },

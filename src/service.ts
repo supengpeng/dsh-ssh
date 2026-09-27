@@ -43,7 +43,7 @@ export interface ServiceLogger {
 }
 
 /** Plugin version, duplicated from package.json at build time. */
-export const PLUGIN_VERSION = '0.1.0'
+export const PLUGIN_VERSION = '0.2.0'
 
 const MAX_PROBE_FRAMES = 200
 
@@ -413,6 +413,27 @@ export class SshPluginService {
   @Remote
   async clearAudit(): Promise<unknown> {
     return this.wire(() => this.apiOf().audit.clear())
+  }
+
+  // =========================================================================
+  // §4.7 Agent activity
+  // =========================================================================
+
+  /**
+   * ICD §4.7 `followActivity` (stream).
+   *
+   * No parameter object: the mirror is global by design (see `ActivityApi`), so
+   * there is nothing for the client to narrow and nothing the host could refuse.
+   */
+  @Remote({ mode: 'stream' })
+  async *followActivity(raw?: unknown): AsyncIterable<Frame> {
+    return yield* this.apiOf().activity.follow()
+  }
+
+  /** ICD §4.7 `clearActivity`. */
+  @Remote
+  async clearActivity(): Promise<unknown> {
+    return this.wire(() => this.apiOf().activity.clear())
   }
 
   // =========================================================================

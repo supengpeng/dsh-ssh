@@ -27,6 +27,7 @@
 | D8 | 配置：**Schemastery Config**（loader 行内 `config`）+ `cordis.patch.yml` 全量默认值；**凭据**走 `ctx.credentials`，**连接档案**走 `ctx.storage` | 与 DSH 配置体系一致；凭据永不进配置文件与日志 |
 | D9 | 客户端 bundle 构建：**自研无依赖汇编器** `scripts/build-client.mjs`（IIFE + `SSH.define/require` 注册表），不用 tsdown/rolldown | 平台 bundle 格式是 `window.__ModuleLoader__.load({id, factory(require)})` 的 lazy-CJS，可手写；DSH 的构建预设不在本机 checkout 内，无法复用 |
 | D10 | 客户端源码**多文件分工、单文件产物**：各 UI 子代理写互不重叠的 `client/src/**` 文件，由汇编器合成唯一 `lib/client.js` | `dsh.client` 只接受每个包一个 client bundle，但 8 个子代理要并行写 → 用"多源单产物"解决写冲突 |
+| D11 | **Agent 活动镜像**（ICD §4.7）：host 侧一个有界内存环（`src/activity/feed.ts` 的 `ActivityFeed`）记录模型经 `ssh_*` 工具做过的事，经 `sshPlugin/followActivity`（流，**无参数**）交给「终端」标签的第二面；`sshPlugin/clearActivity` 清**全局**历史 | 工具调用不经过 client 发起的任何流，所以模型干活时「终端」标签只能是空白；镜像让"模型做了什么"可见。**有界**（`activity.*`，默认 200 条 / 64 KiB 每条 / 1 MiB 全局）是刻意的：它持有的是内存里的**远端原始输出**，是**视图不是日志** —— durable 且脱敏的记录始终是审计文件（ICD §4.6、§12 R10） |
 
 ---
 
@@ -41,6 +42,8 @@ dsh-ssh/
 │   ├── protocol.ts                   冻结的 wire 类型 + 错误码表            [Lead]
 │   ├── index.ts                      Cordis 插件入口（name/inject/Config/apply）[Lead]
 │   ├── api/                          Remote 端点表 + LocalApi 门面（薄委托层）[Lead]
+│   ├── api/activity-api.ts           §4.7 活动镜像的读侧：事件→帧、clearActivity [Lead]
+│   ├── activity/feed.ts              Agent 活动镜像：有界内存环 + 事件广播     [镜像 owner]
 │   ├── config.ts                     Schemastery Config schema              [SP4]
 │   ├── logger.ts / redact.ts         结构化日志 + 脱敏                      [SP4]
 │   ├── credentials.ts                凭据引用（ctx.credentials / env）       [SP4]
@@ -59,6 +62,7 @@ dsh-ssh/
 │   ├── src/store.js                  客户端状态 store + hooks                [SP5]
 │   ├── src/conn/**                   连接列表 / 新建编辑表单 / 搜索分组 / 掩码  [SP5]
 │   ├── src/session/**                终端 / 命令面板 / 文件管理 / 日志          [SP6]
+│   ├── src/session/activity.js       终端标签的第二面：Agent 活动镜像（只读）  [SP6]
 │   ├── src/vendor/xterm.js           vendor 的 xterm                          [SP6]
 │   ├── src/chrome/**                 标签栏 / 状态栏 / 快捷键 / 二次确认 / toast [SP7]
 │   ├── src/theme.css                 --dsw-* 主题对齐样式                     [SP7]
@@ -127,6 +131,23 @@ interface AuditEntry { at: string; op: string; sessionId?: SessionId; profileId?
   outcome: 'ok'|'denied'|'error'; durationMs?: number
   target?: { host: string; port: number; user: string }
   detail?: Record<string, unknown> }   // 已脱敏
+
+// —— Agent 活动镜像（ICD §4.7）：模型经 ssh_* 工具做过什么的**只读投影** ——
+type ActivityKind = 'exec'|'upload'|'download'|'listDir'|'stat'|'connect'|'disconnect'|'sessions'
+type ActivityStatus = 'running'|'ok'|'error'|'timeout'|'cancelled'|'refused'
+type ActivityChannel = 'stdout'|'stderr'|'info'
+interface ActivityChunk { channel: ActivityChannel; text: string }
+
+interface ActivityView {
+  id: string                      // 'act-N'：feed 内单调，clearActivity 后不复用
+  kind: ActivityKind; sessionId: SessionId|null; target: string|null   // 每条记录自带归属
+  subject: string; cwd: string|null; label: string|null
+  startedAt: number; endedAt: number|null; durationMs: number|null
+  status: ActivityStatus; exitCode: number|null; signal: string|null
+  code: string|null; note: string|null
+  segments: ActivityChunk[]       // 到达序；同频道相邻段已合并
+  truncated: boolean              // 丢过字节才为 true；短输出 ≠ 没输出
+}   // 有界视图：非 durable、不脱敏（ICD §4.7、§12 R10）
 ```
 
 ---
@@ -136,10 +157,48 @@ interface AuditEntry { at: string; op: string; sessionId?: SessionId; profileId?
 **单向信封**，与传输绑定解耦：请求 `{ id, method, params }`；响应 `{ id, ok:true, result }` 或 `{ id, ok:false, error:{ code, message, details?, retryable } }`。
 
 **流式帧**（终端输出、命令 stdout/stderr、传输进度、会话状态、审计）统一为 `Frame` 判别联合：`data | exit | progress | state | audit | end`。**禁止轮询**：所有持续输出用流端点；UI 只在流中断时按指数退避重连。
+§4.7 的活动镜像另加三种帧（`activity-snapshot | activity | activity-reset`，正文见 ICD §4.7）：它同样走流端点，但 **host 不为它发 `open`/`end`** —— 订阅以 `activity-snapshot` 开始，取消订阅即结束。客户端在传输层结束时仍会收到一个 `end` 帧（`bridge.js` 在载体结束时补发/转发的结束语义），`ssh.session.activity` 用它清掉订阅句柄而**保留已收到的记录**。
 
-**方法集**（命名空间 `sshPlugin/*`）：`ping`、`listProfiles`、`saveProfile`、`deleteProfile`、`duplicateProfile`、`testProfile`、`connect`、`disconnect`、`listSessions`、`openShell`、`shellWrite`、`shellResize`、`shellClose`、`exec`(流)、`execWait`(一元)、`listDir`、`stat`、`mkdir`、`rename`、`remove`、`chmod`、`upload`(流)、`download`(流)、`cancelTransfer`、`queryAudit`、`followAudit`(流)、`pendingHostKey`、`decideHostKey`。
+**方法集**（命名空间 `sshPlugin/*`）：`ping`、`listProfiles`、`saveProfile`、`deleteProfile`、`duplicateProfile`、`testProfile`、`connect`、`disconnect`、`listSessions`、`openShell`、`shellWrite`、`shellResize`、`shellClose`、`exec`(流)、`execWait`(一元)、`listDir`、`stat`、`mkdir`、`rename`、`removePath`、`chmod`、`upload`(流)、`download`(流)、`cancelTransfer`、`queryAudit`、`followAudit`(流)、`pendingHostKey`、`decideHostKey`、`followActivity`(流，§4.7)、`clearActivity`(一元，§4.7)。
 
 **命名冲突规避**：DSH 已存在 host Service `ssh`（远程主机传输用，非本插件），本插件端点命名空间用 `sshPlugin/*`，自有 host service 用 `ctx.provide('sshPlugin', …)`，**不注册名为 `ssh` 的服务**。
+
+### 5.1 Agent 活动镜像：谁写、谁读（ICD §4.7）
+
+```
+ssh_* 工具（src/tools/*.ts）
+   │  begin / chunk / finish        ← 唯一写入方：只有工具知道"要做什么"和"看到了什么"
+   ▼
+ActivityFeed（src/activity/feed.ts）  ← 有界内存环 + 订阅广播（无队列、无重放、无背压）
+   │  snapshot() + 事件（begin/end 整条、chunk 增量、reset）
+   ▼
+ActivityApi.follow()（src/api/activity-api.ts）  ← 事件→帧的唯一转换点
+   │  帧（activity-snapshot / activity / activity-reset）
+   ▼
+bridge.stream('followActivity')  →  ssh.session.activity 的 store  →  AgentActivityPane
+```
+
+- **写入方只有 agent 工具**（`src/tools/*.ts`）：面板自己发起的 `exec`/`openShell`/上传下载**不进**镜像——它们本来就有自己的流与标签页，镜像因此不会自我循环。
+- **读取方是面板**：`followActivity` 是**一个全局订阅**（无参数，每条记录自带 `sessionId`/`target`），因此"另一个主机上的工作"也看得见；`clearActivity` 清的是**全局**历史，两个面板与一次重载后的页面不得对"模型做过什么"各执一词。
+- **生命周期归 `runtime.ts`**：按 `config.activity` 构造 feed，插件卸载时 `activity.dispose()` 释放已捕获的文本（host 侧**长期**持有远端原始输出的地方，所以"卸载即不留捕获输出"必须是一个动作，而不是对采集器的期望）。
+- **镜像不影响被观察的操作**：`begin`/`chunk`/`finish` 对任何输入都不抛，订阅者抛异常也只记 `warn`（ICD §12 R10）。
+
+### 5.2 「终端」标签的两面与跟随规则（`client/src/panel.js` + `client/src/session/activity.js`）
+
+「终端」标签下面是**两个面**，各有自己的状态；切换器是标签内的一行（`.dsh-ssh-term-switch-row`，组件 `AgentActivitySwitch`）：
+
+| 面 | 渲染 | 是什么 |
+|---|---|---|
+| `terminal` | `ssh.session.terminal` 的 `TerminalTab` | 交互式 PTY —— **用户**的会话（`openShell` 流） |
+| `activity` | `ssh.session.activity` 的 `AgentActivityPane` | **模型**做过什么的只读镜像（全局 feed） |
+
+跟随规则（三条，实现见 `SessionView`）：
+
+1. **有活动的会话直接开在镜像面**：`termFace` 的初值**读 store**（不是等第一帧到达），所以"agent 刚干过活"的会话重新打开时，不会先闪一个空白终端。
+2. **新活动自动切到镜像面**，但有两个例外：①用户**正在终端里打字**（判据是决策点上的 DOM 读 `document.activeElement.closest('.ssh-ws-term')`，避免把正在输入的按键切走）；②**用户自己选过面**（`faceChosenByUser`，显式选择不再被自动切换覆盖）。
+3. **自动切换只看"本会话"**：`summary.total`/`running` 按 `sessionId` 过滤；另一台主机上的工作只点亮全局未读徽标（`summary.all.unread`），不会抢走当前视图。切到镜像面时标记已读（`markActivitySeen()`）。
+
+镜像面自身的边界：只画最新 200 条（store 保留 400 条）；用户上滚即停止跟随并出现"跳到最新"；`清除` **先清本地**、再**尽力**调用 `clearActivity`（传输不可用时也能清屏，且下一次重载不会把用户刚清掉的历史带回来）。镜像**只渲染、不驱动**：它不发起任何 `exec`、按键或传输。
 
 ---
 

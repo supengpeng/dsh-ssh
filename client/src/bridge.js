@@ -233,7 +233,7 @@ SSH.define('ssh.bridge', function (SSH) {
     'connect', 'disconnect', 'listSessions', 'getSession', 'pendingHostKey', 'decideHostKey',
     'execWait', 'shellWrite', 'shellResize', 'shellSignal', 'shellClose', 'listStreams',
     'listDir', 'listLocalDir', 'stat', 'statLocal', 'mkdir', 'rename', 'removePath', 'chmod',
-    'cancelTransfer', 'listTransfers', 'queryAudit', 'clearAudit',
+    'cancelTransfer', 'listTransfers', 'queryAudit', 'clearAudit', 'clearActivity',
   ]
 
   /**
@@ -252,7 +252,7 @@ SSH.define('ssh.bridge', function (SSH) {
   ])
 
   /** Stream endpoints from ICD §4 (`@Remote({ mode: 'stream' })` on the host). */
-  const STREAM_METHODS = ['exec', 'openShell', 'followSessions', 'followAudit', 'upload', 'download']
+  const STREAM_METHODS = ['exec', 'openShell', 'followSessions', 'followAudit', 'upload', 'download', 'followActivity']
 
   /**
    * Wire field the host expects for a method's business argument, taken from the host's
@@ -281,7 +281,7 @@ SSH.define('ssh.bridge', function (SSH) {
   })
 
   /** Methods whose host signature takes no argument at all (`args: {}`). */
-  const ZERO_ARG_METHODS = Object.freeze(['getConfig', 'listSessions', 'listTransfers', 'clearAudit'])
+  const ZERO_ARG_METHODS = Object.freeze(['getConfig', 'listSessions', 'listTransfers', 'clearAudit', 'clearActivity'])
 
   /** Probe order when the mapped field is not the one this host wants. */
   const WIRE_ARG_CANDIDATES = Object.freeze(['raw', '_raw', 'params', 'payload'])

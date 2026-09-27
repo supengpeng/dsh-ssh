@@ -29,6 +29,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { ResolvedConfig } from '../config.js';
+import { ActivityFeed } from '../activity/feed.js';
 import { type SshAuditor } from '../audit.js';
 import { type ConnectionPool } from '../connection/index.js';
 import { type SshCredentialResolver } from '../credentials.js';
@@ -54,6 +55,7 @@ export interface HostRuntime {
         credentials: SshCredentialResolver;
         knownHosts: KnownHostsVerifierImpl;
         audit: SshAuditor;
+        activity: ActivityFeed;
         pool: ConnectionPool;
         registry: SessionRegistry;
         exec: ExecService;

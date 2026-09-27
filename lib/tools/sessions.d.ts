@@ -27,10 +27,20 @@
  */
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
 import { type SessionInfo } from '../protocol.js';
+import type { ActivityFeed } from '../activity/feed.js';
 export declare const SESSIONS_TOOL_NAMES: readonly ["ssh_connect", "ssh_disconnect", "ssh_sessions"];
 export type SessionsToolName = (typeof SESSIONS_TOOL_NAMES)[number];
 /** What the tools need from the plugin; injected so this file imports no module. */
 export interface SessionsToolDeps {
+    /**
+     * The agent-activity mirror (ICD §4.7).
+     *
+     * Optional because the mirror is an observation, not a dependency (the Lead's
+     * composition always supplies one): when it is absent these tools behave exactly
+     * as they did before, and when it is present each call — refusals included — is
+     * recorded for the panel's 终端 tab.
+     */
+    activity?: ActivityFeed;
     /** `registry.list()` — the same projection the UI and `sshPlugin/listSessions` read. */
     listSessions(): SessionInfo[];
     /**

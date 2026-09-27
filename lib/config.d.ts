@@ -34,6 +34,7 @@ export interface Config {
     maxSessions: number;
     maxConcurrentOpsPerSession: number;
     maxOutputBytes: number;
+    maxReplayFrames: number;
     connectTimeoutMs: number;
     operationTimeoutMs: number;
     graceKillMs: number;
@@ -44,6 +45,7 @@ export interface Config {
     sftp: SftpConfig;
     secrets: SecretsConfig;
     logging: LoggingConfig;
+    activity: ActivityConfig;
     confirmDangerous: boolean;
     allowAgentTools: boolean;
     tools: string[];
@@ -75,6 +77,13 @@ export interface LoggingConfig {
     level: 'debug' | 'info' | 'warn' | 'error';
     redact: boolean;
     redactKeys: string[];
+}
+/** The agent-activity mirror's limits (ICD §4.7, §6). */
+export interface ActivityConfig {
+    enabled: boolean;
+    maxRecords: number;
+    maxRecordBytes: number;
+    maxTotalBytes: number;
 }
 export interface UiConfig {
     defaultWidthPx: number;

@@ -22,6 +22,7 @@
 import type { ResolvedConfig } from '../config.js';
 import type { PluginLogger } from '../logger.js';
 import type { SshAuditor } from '../audit.js';
+import type { ActivityFeed } from '../activity/feed.js';
 import type { ConnectionPool } from '../connection/index.js';
 import type { SessionRegistry } from '../sessions.js';
 import type { ExecService } from '../exec/service.js';
@@ -46,6 +47,15 @@ export interface ToolRegistrationOptions {
     registry: SessionRegistry;
     transfers: TransferManager;
     audit: SshAuditor;
+    /**
+     * The agent-activity mirror (ICD §4.7).
+     *
+     * Passed to the tools rather than recorded here, because only the tool knows
+     * what it is about to do (the command, the paths, the resolved session) and only
+     * the tool sees the live frames while it waits. This layer's job stays what it
+     * was: register the tools and audit what they finished.
+     */
+    activity: ActivityFeed;
     log: PluginLogger;
     /**
      * The session/profile endpoints, so `ssh_connect` takes exactly the same path as

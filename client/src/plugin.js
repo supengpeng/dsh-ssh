@@ -4,8 +4,9 @@
  *
  * Client plugin body: the entry DSH's module loader materialises for this
  * package. It wires the bridge and the store, then registers the panel icon,
- * the right-sidebar tab type and its body — each registration independently, so
- * one unavailable seat degrades to a reported problem instead of a dead panel.
+ * the right-sidebar tab type and its body, and the `ssh_exec` conversation card —
+ * each registration independently, so one unavailable seat degrades to a reported
+ * problem instead of a dead panel.
  *
  * Injected services are the two every composition provides. `sidebarRightTabs`
  * and `sidebarRight` are looked up opportunistically and their absence is
@@ -31,7 +32,7 @@ SSH.define('ssh.plugin', function (SSH) {
    * logged once when the plugin body applies and is greppable in `lib/client.js`, so a
    * single console line settles whether the code on screen is the code on disk.
    */
-  const BUILD_MARKER = 'ssh-client-2026-09-26.6-tab-id-normalised'
+  const BUILD_MARKER = 'ssh-client-2026-09-27.7-agent-activity'
 
   /**
    * The plugin body's own strings.
@@ -397,6 +398,26 @@ SSH.define('ssh.plugin', function (SSH) {
     attempt('spike overlay', () =>
       slots.inject('shell.overlay', () =>
         slots.register({ name: 'shell.overlay', id: 'ssh-spike', order: 999, label: t('spike.title') }, panel.SpikeOverlay)))
+
+    // 7. Conversation card: the `ssh_exec` tool call as a terminal row.
+    //
+    //    The Host half already projects the terminal presentation
+    //    (`src/tools/exec.ts` `presentCall`/`presentResult`/`envelopePresentation`),
+    //    but the Web client never renders Host card views: it dispatches the keyed
+    //    slot `tool.call.toolview` by *wire tool name* and falls back to a generic
+    //    row. Registering this key is what turns an `ssh_exec` call into a card —
+    //    and because a keyed hit REPLACES the generic row, the occupant is the whole
+    //    row (hence `ssh.toolview`'s "always render, never throw" contract).
+    //
+    //    The key comes from the component module, which documents it as the mirror
+    //    of `SSH_EXEC_TOOL_NAME` in the host half. A composition whose slot registry
+    //    has no such seat reports it here instead of breaking the other seats.
+    attempt('tool view', () => {
+      const toolview = safeRequire('ssh.toolview')
+      if (!toolview || typeof toolview.SshExecCard !== 'function') throw new Error('ssh.toolview is unavailable')
+      return slots.inject('tool.call.toolview', () =>
+        slots.register({ name: 'tool.call.toolview', key: toolview.TOOL_NAME }, toolview.SshExecCard))
+    })
 
     // Kick off carrier discovery immediately: the result is the spike's evidence.
     const resolution = bridge

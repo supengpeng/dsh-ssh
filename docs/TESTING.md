@@ -78,14 +78,87 @@ node scripts/verify-all.mjs --list          # 列出层与超时
 - 口径：**errors = 正确性（挡门），warnings = 风格（不挡门）**；M4 的"lint 零错误"= **0 errors**。
 - TypeScript 由 `tsc --noEmit` 负责（ESLint core 不能解析 TS；不为插件包引入 typescript-eslint 依赖）。
 
+### 2.5 宿主半边在本机（Windows）**不能**热更新 —— 实测结论（2026-09-27）
+
+**结论先说**：在这台机器上，**重建 `lib/**` 不会让运行中的 GUI 拿到新代码**；让新代码生效**必须重启 DSH**。
+toggle `include:dsh-ssh` 行（`plugin_manager` 关→开）**不是**替代方案：它只让 Loader 用**已缓存**的模块重跑一次 `apply()`，模块字节不会被重新导入。
+
+**证据（两条数字对不上，就是没热更新）**：
+
+| 观察对象 | 数字 | 说明 |
+|---|---|---|
+| 构建产物 `lib/service.js` | **44** 个 Remote 方法 | 构造内建类后调 `remoteMethods(instance)` 得到，含 `followActivity`/`clearActivity` |
+| 活着的 host 写的 `<DSH_HOME>\logs\dsh-ssh\host-ready.json`（`2026-09-27T04:44:42.447Z`） | **42** 个 Remote 方法 | `remoteMethods` 列表里**恰好缺** `followActivity`/`clearActivity` |
+| 上述标记的生成时机 | 一次完整的 toggle 之后（`application: "applied"`） | 即"重跑过 `apply()` 仍是旧方法集" |
+
+`host-ready.json` 由 `src/index.ts` 的 `recordHostReady()` 在每次 `apply()` 时写入，`remoteMethods: [...]` 就是**这个进程里实际注册的**端点列表 —— 因此它是"新代码有没有进来"的**唯一可靠判据**（比 console 与日志都可靠：它们看不到"apply 没跑"与"apply 跑了但用了旧模块"的区别）。
+
+**根因（实测到 picomatch 一层）**：shipped `hmr` 行的 `ignored` 默认值是
+`['**/node_modules', '**/.*', 'cache', 'data']`（`packages/boot/hmr`，`root` 默认 `['.']`），而监视谓词不是直接拿每个 pattern 去比绝对路径，而是比**相对 `baseDir` 的路径**：
+
+```js
+// 摘自 packages/boot/hmr（为说明合并了行；原文另有 ...this.config 与 ignoreInitial）
+this.baseDir = fileURLToPath(new URL(config.base || '.', ctx.baseUrl))   // = profile 目录
+const watchBaseDir = realpathSync(this.baseDir)
+const match = picomatch(ignored)
+this.watcher = watch(root, { cwd: watchBaseDir, ignored: path => match(relative(watchBaseDir, path)) })
+```
+
+本机 `baseDir` 是 profile 目录（`…\.dsh\profiles\desktop`），而监视根是它的**兄弟**目录 `C:\Users\Administrator\.dsh\plugins\dsh-ssh`。于是 Windows 上
+
+```
+relative('C:\Users\Administrator\.dsh\profiles\desktop',
+         'C:\Users\Administrator\.dsh\plugins\dsh-ssh\lib\service.js')
+  = '..\..\plugins\dsh-ssh\lib\service.js'
+```
+
+**picomatch 不把 `\` 当分隔符**，所以整个字符串是**一段**、且以 `.` 开头 ⇒ 默认的 `**/.*` 命中 ⇒ **整棵树每个文件都被忽略**，重建 `lib/**` 一个事件都不产生。实测（`packages/boot/hmr/node_modules/picomatch`）：
+
+| 输入 | `picomatch(['**/node_modules','**/.*','cache','data'])` | 含义 |
+|---|---|---|
+| `..\..\plugins\dsh-ssh\lib\service.js`（Windows 实态） | **`true`** | 被忽略 ⇒ 没有 reload 事件 |
+| `../../plugins/dsh-ssh/lib/service.js`（同路径、正斜杠） | `false` | **证明**分歧来自"反斜杠不是分隔符" |
+| `node_modules/x.js`（profile 内） | `true` | 默认值本身工作正常，问题只在跨目录+反斜杠 |
+
+**修复（已写进 profile 的托管块）**：`scripts/profile-install.mjs` 的 `hmrBlock()` 现在把监视根**直接指向三个源码树**，并**清空 `ignored`**：
+
+```yaml
+# >>> dsh-ssh hmr watch (managed by dsh-ssh) >>>
+- id: hmr
+  config:
+    root:
+      - <PACKAGE_DIR>/lib          # hmrBlock() 写出绝对路径、并用正斜杠
+      - <PACKAGE_DIR>/src
+      - <PACKAGE_DIR>/client/src
+    ignored: []
+# <<< dsh-ssh hmr watch <<<
+```
+
+**为什么 `ignored: []` 是安全的**：这三个树里没有 `node_modules`、也没有点目录，默认忽略规则在此处没有要挡的东西；而**用正斜杠的绝对根**同时绕开了"相对 profile 的路径以 `..` 开头"这一条。`--status` 会核对托管块是否存在：
+
+```powershell
+node scripts/profile-install.mjs --profile "$env:USERPROFILE\.dsh\profiles\desktop" --status
+#   hmr watch block         : present
+```
+
+> **注意生效时机**：托管块是**为下一次 DSH 启动准备**的 —— `hmr` 行在启动时装载，改 profile patch 不会让已加载的监视器按新配置重来。因此 **2026-09-27 这次修复并没有让新代码进入正在运行的实例**（它仍是 42 方法集，见 `docs/ACCEPTANCE.md` §13.3）。
+
+**对所有人的操作含义**：
+1. 改 host 半边后，**不要**用"toggle 了行 + 页面没变化"来判断自己的改动没写对 —— 先看 `host-ready.json` 的方法数/字段是否变过。
+2. 本机要验证 host 改动，**只能重启 DSH**（这不是插件缺陷，是 Windows 上 `relative()` 路径分隔符与 picomatch 的交互）。
+3. 组件层（`client/src/**`）不受影响：那条路径仍由 `lib/client.js` 的字节变化触发页面重新 `apply()`（见 §7 第 3 条）。
+4. 相关记录：`src/index.ts` 头部（写给下一位维护者）、`docs/ACCEPTANCE.md` §13（验收留痕）、`docs/M0-SPIKE.md` §8（当年 §7.3 的"未确认"结案）。
+
 ## 3. 自测结果（交付者填写）
 
 | 层 | 命令 | 结果 |
 |---|---|---|
-| 类型 | `tsc -p tsconfig.json --noEmit` | 见 `verify-all` 输出（收敛中；`src/api/runtime.ts` 落地后回到 0 错） |
+| 类型 | `node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit` | **exit 0**（2026-09-27，agent 活动镜像落地后；此前的"收敛中"状态已结束） |
+| 单测（host 全层） | `node --test --test-concurrency=1 --test-force-exit --test-timeout=60000 "test/unit/*.test.mjs"` | **585 项：582 pass / 0 fail / 3 skip**（2026-09-27 全量复跑）。注：首轮曾在 `test/unit/connection-auth.test.mjs` 出现 1 次与本次改动**无关**的顺序性抖动（`Malformed OpenSSH private key`）——该文件单独跑 **17/17**、全层复跑 **0 fail**，代码路径未被本次改动触碰 |
+| 组件（client 全层） | `node --test --test-concurrency=1 --test-timeout=30000 "test/client/*.test.mjs"` | **255 pass / 0 fail**（含活动面 8、会话卡片 13；本功能另新增 `activity` 28、`toolview` 13、独立验证者 16 个用例） |
 | Lint | `node scripts/lint.mjs` | 0 errors / 若干 warning（`prefer-const`、未使用 disable 注释）；**4 处第一方硬编码色值**（`client/src/core.js:91`、`client/src/chrome/theme.gen.js:308/392/507`）已派单 sp5/sp7，属预期中间态 |
 | 靶机自测 | `node --test --test-concurrency=1 "test/integration/sshd-double.test.mjs"` | **13/13 pass，约 13s，进程正常退出** |
-| 契约一致性 | `node --test --test-concurrency=1 "test/integration/icd-conformance.test.mjs"` | **6 pass / 2 skip**：§5 全 32 码 + retryable 一致、§3 帧不变式（真流）、§8.5 124 个冻结键双语齐全、§0 包/入口/bundle、§6 patch 默认值；**§4 方法表 39 个方法尚未接线**（`src/service.ts` 仍只有 M0 的 `ping`），以带理由的 skip 报告，`DSH_SSH_STRICT_ICD=1` 会转硬失败 |
+| 契约一致性 | `node --test --test-concurrency=1 --test-force-exit --test-timeout=60000 test/integration/icd-conformance.test.mjs` | **7 pass / 1 skip / 0 fail**（2026-09-27，agent 活动镜像落地后）：§5 全 32 码 + retryable 一致、§3 帧不变式（真流）、**§4 方法表 41/41 存在**（含 §4.7 的 `followActivity`/`clearActivity`）、§8.5 **163 个冻结键**双语齐全（各 214 键、集合相同）、§0 包/入口/bundle、§6 patch 默认值；唯一 skip 是 §4.2「需活的服务实例 + 凭据库」，**带理由**（`DSH_SSH_STRICT_ICD=1` 会把它转硬失败）。命令与逐项数字另见 `docs/ACCEPTANCE.md` §12 |
 | 集成 | `node --test --test-concurrency=1 "test/integration/stack.test.mjs"` | 12 例：连接（密码/公钥/内联/文件/加密+passphrase）、失败码映射、host-key 三档 + known_hosts 回读、exec（env/cwd/exit/stderr/超时→exit-signal）、stdin/signal/cancel、PTY（含 resize 与全屏 `top`）、SFTP 全操作 + chmod 回读 + 4MiB 流式一致 + offset 续写、10 会话无串扰、池上限与断链注入 |
 | E2E | `node test/e2e/run.mjs` | **9/9 步通过**：新建连接→连接→PTY `uname -a`(+`top` 全屏)→exec 帧不变式→2MiB 上传→下载回读→10 会话并发→断开无残留→日志无凭据 |
 | 性能 | `node --test --test-concurrency=1 "test/perf/*.test.mjs"` | 100MiB 上传/下载字节一致；10 会话并发各自哈希匹配；实测见 §5 数字 |
@@ -178,3 +251,4 @@ pnpm test:real            # 或 node scripts/verify-all.mjs --real
 5. 文档同步：`README.md`（配置/FAQ）、`docs/TESTING.md`（命令/实测）、`CHANGELOG.md`（变更条目）。
 6. 改了**布局 / 可见性**（`client/src/session/**` 的样式或结构）→  组件测试**证明不了几何**（linkedom 无布局引擎，"元素存在 ≠ 元素可见"），必须补一张真实浏览器截图：`npm run docs:shots`（见 [`SCREENSHOTS.md`](./SCREENSHOTS.md)），并在该文件里更新说明。
 7. 交付前确认**没有孤儿测试进程**（见 §2.2.1）：残留进程会让下一次聚合运行停等，看起来像"套件挂了"。
+8. 改了 **host 半边**（`src/**`）→ 记住本机**不会热更新**（§2.5）：`tsc` 0 错只说明产物是对的，**不说明 GUI 里的实例换了新代码**。判断"进没进去"看 `<DSH_HOME>\logs\dsh-ssh\host-ready.json` 的 `remoteMethods`，要真正生效需重启 DSH；**不要**把"toggle 行后行为没变"当成新代码有 bug 的证据。

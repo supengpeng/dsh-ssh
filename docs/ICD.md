@@ -184,6 +184,8 @@ type Frame =
   | { t:'end';      streamId: StreamId; reason: 'completed'|'cancelled'|'timeout'|'error'|'peer-closed'; error?: ErrorInfo }
 ```
 
+> **v1.0.11 补充（正文见 §4.7）**：agent 活动镜像另有三种帧 —— `activity-snapshot`、`activity`、`activity-reset`。它们的判别式与载荷在 §4.7 冻结，**不并入上面的联合**：本节出现的判别式字面量集合被契约门 `test/integration/icd-conformance.test.mjs` 逐字钉住（见 §12 R10），改本节必须同时改那条断言。
+
 **调度不变式**（SP2/SP3/SP8 必须遵守与验证）：
 - 每条流以 `open` 开始、以 `end` 结束，二者各恰好一次。
 - `data.seq` 从 0 起严格递增，无空洞、无重复（重连后由客户端按 `seq` 去重）。
@@ -316,6 +318,69 @@ interface FileInfo extends DirEntry { exists: boolean; uid?: number; gid?: numbe
 | `sshPlugin/followAudit` | S | `{ sessionId?: SessionId }` | 帧 `audit` |
 | `sshPlugin/clearAudit` | R | `{}` | `{ cleared: number }` |
 
+### 4.7 Agent 活动镜像（v1.0.11 新增）
+
+模型经 `ssh_*` 工具做的事**不经过** §4.4/§4.5 的任何端点：浏览器只画得出**它自己发起的**流，所以在 §4.7 之前，模型干活时用户盯着「终端」标签看到的是一片空白，事后也无从查起。§4.7 把「模型做过什么」做成一面**只读的镜子**：host 侧一个**有界的内存环**（`src/activity/feed.ts` 的 `ActivityFeed`）记录这些操作，本节的两个端点把它交给面板。
+
+| 方法 | 类型 | 参数 | 返回 |
+|---|---|---|---|
+| `sshPlugin/followActivity` | S | **无参数**（传入值被忽略 —— 镜像是全局的） | 帧 `activity-snapshot` / `activity` / `activity-reset`（见下） |
+| `sshPlugin/clearActivity` | R | `{}` | `{ cleared: number }` —— 丢掉的**已结束**记录条数 |
+
+**为什么 `followActivity` 没有 `sessionId` 参数（冻结，不得加）**：镜像记录的是模型做过的**一切**，包括针对「当前可见标签之外的主机」的操作。加一个 `sessionId` 过滤会把 agent 的工作**静默藏起来**；因此会话归属是**每条记录的字段**（`ActivityView.sessionId` / `target`），而「是否只显示本会话」是**视图的决定**，不是 wire 的约束。同理 `clearActivity` 清的是**全局**历史：两个面板（或一次重载后的页面）不得对「模型做过什么」各执一词。
+
+**帧（3 种，判别式 `t`）**：
+
+```ts
+// Frame 联合中属于 §4.7 的成员（判别式 t）；实现见 src/protocol.ts
+  | { t:'activity-snapshot'; activities: ActivityView[] }              // 订阅成功后的**第一帧**
+  | { t:'activity'; phase:'begin'|'end'; activity: ActivityView }      // 一条记录的出生 / 终态（整条）
+  | { t:'activity'; phase:'chunk'; id: string; chunk: ActivityChunk }  // 一条记录的增量输出
+  | { t:'activity-reset' }                                            // host 丢掉了已结束历史
+```
+
+**调度不变式**：
+
+- **`activity-snapshot` 是 `followActivity` 的第一帧**，且**替换**客户端已有的列表：它先于该订阅的任何事件发出，重连不得因此产生重复记录，也不存在「订阅与取当前态之间开始的记录永不被宣告」的窗口。
+- `begin` 早于该记录的任何 `chunk`/`end`；`end` 每条记录**至多一次**（feed 的 `finish` 幂等，第二次调用不改字段、不发帧），且携带**整条**记录，客户端以它替换自己的副本。
+- `chunk` **只携带真正留在 host 环里的那一段文本**（被 `activity.maxRecordBytes` 截断时是截断后的前缀）。因此「客户端按 delta 打补丁」的结果与 host 的 `snapshot()` **逐字节一致**。
+- `activity-reset` **只在 `clearActivity` 真的丢掉了记录时**发出。一次没丢任何东西的 `clearActivity` 不发：此时让客户端清空，反而会把它正在画的**运行中**记录一并抹掉。
+- 运行中的记录**不参与淘汰**：环满时先丢最老的**已结束**记录（静默，不发帧）；`maxTotalBytes` 也不会把环清空。
+- `followActivity` 的 generator **不发** `open`/`end`：它只转发 feed 事件，**取消订阅**（客户端对流的 `return()`）是其唯一清理路径，`finally` 释放监听器。客户端仍可能在传输结束时收到一个 `end` 帧（那是绑定层的结束语义，见 §1）；无论哪种结束，**已收到的记录都不消失**。
+
+**类型（`src/protocol.ts`，冻结）**：
+
+```ts
+type ActivityKind = 'exec' | 'upload' | 'download' | 'listDir' | 'stat' | 'connect' | 'disconnect' | 'sessions'
+type ActivityStatus = 'running' | 'ok' | 'error' | 'timeout' | 'cancelled' | 'refused'
+type ActivityChannel = 'stdout' | 'stderr' | 'info'
+
+interface ActivityChunk { channel: ActivityChannel; text: string }
+```
+
+`ActivityKind` 是**工具能做的操作**（不是 wire 端点）；`ActivityChannel.info` 是插件自己的叙述（如 `finish` 的收尾文字）。**未知取值一律归一化进词表**（`kind`→`exec`、`status`→`error`、`channel`→`info`），且**绝不为看不懂的结果报成功**。
+
+> **词表 ≠ 当前工具集**：`ActivityKind` 是**冻结词表**（`kind` 逐条对应一类操作），其中 `stat` 目前**没有**模型可见的工具会产生它 —— 7 个工具里只有 `ssh_list_dir` 会读远端元数据。为将来新增 `ssh_stat` 之类的工具保留该取值，不代表现在会看到 `stat` 记录。
+
+| `ActivityView` 字段 | 类型 | 含义 |
+|---|---|---|
+| `id` | `string` | `act-N`；feed 内单调，**`clearActivity` 后不复用** |
+| `kind` | `ActivityKind` | 这是哪类操作 |
+| `sessionId` | `string \| null` | 该操作归属的会话；`null` 表示与某个连接无关（如 `ssh_sessions`） |
+| `target` | `string \| null` | 会话已知时为 `user@host`，否则 `null` |
+| `subject` | `string` | 一行说明「跑了什么」：命令原文、`localPath → remotePath`（下载为 `←`）、profileId / `user@host`… |
+| `cwd` / `label` | `string \| null` | 工作目录 / 显示名 |
+| `startedAt` | `number` | epoch ms |
+| `endedAt` / `durationMs` | `number \| null` / `number \| null` | 终态时间与时长；`durationMs` 夹到 ≥0 |
+| `status` | `ActivityStatus` | 终态分类；`running` 表示尚未结束 |
+| `exitCode` / `signal` | `number \| null` / `string \| null` | 命令退出码 / 终止信号 |
+| `code` | `string \| null` | 失败或被拒时的 §5 错误码 |
+| `note` | `string \| null` | 人读的补充（通常是错误 message） |
+| `segments` | `ActivityChunk[]` | 按到达顺序的输出；**同频道相邻段已合并** |
+| `truncated` | `boolean` | 是否丢过字节。**短输出 ≠ 没输出**：只有它为 `true` 时才说明文本被截断 |
+
+**与审计的关系（冻结）**：活动镜像是一个**有界视图，不是日志**。durable、脱敏的记录是 §4.6 的审计文件（`sshPlugin/queryAudit` / `followAudit`）；镜像只在 host 进程内存里保留最近若干条、每条若干字节（§6 `activity.*`），**不落盘、不脱敏、不承诺跨重载或重启存活**。它持有的正是用户自己的会话产生的输出，所以 host 不在这里做脱敏（脱敏后的副本是审计文件的职责）。边界与文档纪律见 §12 R10。
+
 ---
 
 ## 5. 错误码表（冻结）
@@ -398,6 +463,12 @@ export interface Config {
     redact: boolean               // true
     redactKeys: string[]          // ['password','passphrase','privateKey','secret','token','key','authorization']
   }
+  activity: {                     // §4.7 agent 活动镜像的边界
+    enabled: boolean              // true      —— false 时记录操作整体不产出（零事件、空快照）
+    maxRecords: number            // 200       —— 保留的记录条数；环满先丢最老的**已结束**记录
+    maxRecordBytes: number        // 65536     —— 单条记录的文本上限；超出丢尾部并置 truncated
+    maxTotalBytes: number         // 1048576   —— 整个 feed 的文本上限
+  }
   maxOutputBytes: number          // 262144
   confirmDangerous: boolean       // true
   allowAgentTools: boolean        // true
@@ -411,7 +482,7 @@ export interface Config {
 }
 ```
 
-**对外投影** `PublicConfig`（`getConfig` 返回）：去掉 `secrets`（只回 `{ provider, envPrefix }`）与 `logging.redactKeys`，其余原样。**任何情况下不回显凭据**。
+**对外投影** `PublicConfig`（`getConfig` 返回）：去掉 `secrets`（只回 `{ provider, envPrefix }`）与 `logging.redactKeys`，其余原样（含 `activity`，它是**上限**而非凭据）。**任何情况下不回显凭据**。
 
 **环境变量覆盖**（优先级从高到低）：`DSH_SSH_<PROFILE_SLUG>_PASSWORD` / `_PASSPHRASE` > `ctx.credentials` 记录 > profile 内一次性输入。环境变量**只读**，UI 显示 `source:'env'` 且不允许回显。
 
@@ -683,7 +754,7 @@ ShortcutHelp({ open, onClose, bindings })
 ### 8.5 i18n 键（冻结清单）
 
 `locale/{zh,en}.json` 顶层为 flat 键，命名空间 `ssh`。必须覆盖：
-`tab.title`, `panel.title`, `panel.toggle`, `conn.list.empty`, `conn.list.search`, `conn.list.group`, `conn.new`, `conn.edit`, `conn.delete`, `conn.duplicate`, `conn.test`, `conn.connect`, `conn.disconnect`, `conn.field.name|host|port|user|auth|password|privateKey|passphrase|timeout|keepalive|group|tags`, `conn.auth.password|privateKey|agent`, `conn.secret.show|hide|present|absent|fromEnv`, `conn.state.idle|connecting|authenticating|connected|closing|closed|error`, `conn.confirm.delete`, `conn.test.ok`, `conn.test.fail`, `ws.tabs.terminal|command|files|logs`, `ws.term.clear|copy|paste|fontUp|fontDown|reconnect|reconnected`, `ws.cmd.placeholder|run|cancel|clear|exitCode|stdout|stderr|duration|history`, `ws.files.local|remote|upload|download|mkdir|rename|delete|chmod|refresh|hidden|overwrite`, `ws.files.progress`, `ws.logs.level|clear|export|empty`, `status.rtt|uptime|traffic|disconnected`, `confirm.danger.title|body|typeToConfirm`, `toast.copied|copiedFailed|saved|deleted|uploaded|downloaded`, `err.<CODE>`（§5 全表，逐条）。
+`tab.title`, `panel.title`, `panel.toggle`, `conn.list.empty`, `conn.list.search`, `conn.list.group`, `conn.new`, `conn.edit`, `conn.delete`, `conn.duplicate`, `conn.test`, `conn.connect`, `conn.disconnect`, `conn.field.name|host|port|user|auth|password|privateKey|passphrase|timeout|keepalive|group|tags`, `conn.auth.password|privateKey|agent`, `conn.secret.show|hide|present|absent|fromEnv`, `conn.state.idle|connecting|authenticating|connected|closing|closed|error`, `conn.confirm.delete`, `conn.test.ok`, `conn.test.fail`, `ws.tabs.terminal|command|files|logs`, `ws.term.clear|copy|paste|fontUp|fontDown|reconnect|reconnected`, `ws.cmd.placeholder|run|cancel|clear|exitCode|stdout|stderr|duration|history`, `ws.files.local|remote|upload|download|mkdir|rename|delete|chmod|refresh|hidden|overwrite`, `ws.files.progress`, `ws.logs.level|clear|export|empty`, `ws.activity.tab|session|running|ok|error|timeout|cancelled|refused|exit|duration|truncated|done|started|copy|follow|latest|clear|empty|emptyHint`, `tool.title|running|ok|failed|refused|timeout|cancelled|outputLimit|exit|signal|stdout|stderr|noOutput|pendingCommand|emptyCommand|inspect|duration|stream|session|cwd`, `status.rtt|uptime|traffic|disconnected`, `confirm.danger.title|body|typeToConfirm`, `toast.copied|copiedFailed|saved|deleted|uploaded|downloaded`, `err.<CODE>`（§5 全表，逐条）。
 **英文键必须与中文键一一对应**（由单测断言键集合相等）。
 
 ### 8.6 主题（冻结）
@@ -733,6 +804,7 @@ ShortcutHelp({ open, onClose, bindings })
 | v1.0.9 | 2026-09-25 | §4.4 新增 `exec` 的 `pty?: boolean`（默认 false，v1.0.9）。补齐 wire 面与内部 API `ExecInput.pty` / `ssh_exec` 工具之间的不对称（"工具能做、UI 不能做"）。明文记录 PTY 的语义后果：**stderr 合并进 stdout**，置 true 时只有 `channel:'stdout'` 帧；并区分 `exec{pty:true}`（一次性、有 deadline 与截断）与 `openShell`（持久交互、无截断、可 resize）。同步：工具清单定为 7 个（新增 `ssh_connect`/`ssh_disconnect`/`ssh_sessions`，因为此前**没有任何工具能创建会话**，`ssh_exec`/`ssh_upload` 实际不可用） | Lead |
 | v1.0.8 | 2026-09-25 | §8.6 **收紧**：取消 v1.0.2 的"中性黑/白 alpha 阴影例外"，第一方代码**零硬编码色值**（含阴影），阴影必须 token 派生（如 `box-shadow: 0 12px 32px color-mix(in srgb, var(--dsw-alias-label-primary) 18%, transparent)`）。依据：`rgba(0,0,0,α)` 在暗色模式下几乎不可见 → 属**主题保真缺陷**而非风格问题；且单一规则比"带判断例外的规则"更可审计。同步：单测扫描与 sp8 的 `scripts/lint.mjs` 现在规则完全一致（实测精确命中同 4 处）。§8.3 备注 sp6 的两个向后兼容补充（`onExport(text, format, entries)`、`levelFilter` 受控初值 + 可选 `onLevelFilterChange`） | Lead |
 | v1.0.7 | 2026-09-25 | §7.1 澄清 `HostKeyQuestion`（UI 提问结构，无密钥材料）与 `HostKeyVerifyQuestion`（验签入参，含公钥字节）**故意不同名、不得合并**。§4.2/§7.3 记录 sp4 完成 T4 的向后兼容强化：`ConnProfileView.secretRefs` 实装为**必填**（强于 optional）；`ResolvedProfile` 定为**扁平** `ConnProfile & { secrets }`（与 sp1 镜像一致）；`ResolvedSecrets` 增必填 `source:{password,passphrase}` 与掩码 `toJSON()`；`store.save()` 接受内部 `ConnProfilePatch`（合并语义 + `forceNew`），端点入参仍用冻结的 `ConnProfileInput` | Lead |
+| v1.0.11 | 2026-09-27 | 新增 **§4.7 Agent 活动镜像**：端点 `followActivity`（S，**无参数**——镜像是全局的，会话归属是每条记录的字段，过滤属于视图决定）/ `clearActivity`（R，`{}` → `{ cleared }`）；三种帧 `activity-snapshot` / `activity` / `activity-reset` 及其调度不变式；类型 `ActivityKind`/`ActivityStatus`/`ActivityChannel`/`ActivityChunk`/`ActivityView`。§6 补 `activity.{enabled,maxRecords,maxRecordBytes,maxTotalBytes}`（200/65536/1048576，已随实现落在 `config.ts` 与 `cordis.patch.yml`），`PublicConfig` 含 `activity`。§12 新增 **R10**：镜像是**有界视图**而非 durable 日志（审计文件才是），含文档/写作用域纪律（§8.5 键表只列双语已存在的键；§3 帧字面量集合被契约门钉住，新帧正文放 §4.7）。§3 联合本身未改，仅加指向 §4.7 的说明 | Lead |
 
 ---
 
@@ -820,9 +892,11 @@ M0.5 的出口标准：一次真实页面调用后，host 侧写入的诊断记�
 
 | 改动 | 是否会生效 | 必须做什么 |
 |---|---|---|
-| host 半边 `src/**` → `lib/**` | 部分（端点的**实现**会跟随） | 重新 `tsc`；需要 `apply()` 重跑（如新增注册/服务）时 **toggle 该插件行**：`plugin_manager {action:'set_plugin', target:'include:dsh-ssh', enabled:false}` 再 `true` |
+| host 半边 `src/**` → `lib/**` | **本机（Windows）实测：不会**（见下表后的更正） | 重新 `tsc`；然后**重启 DSH**。toggle 该插件行**只重跑 `apply()`、不重新导入模块字节**（v1.0.11 实测更正） |
 | client 半边 `client/src/**` | 仅当 **`lib/client.js` 字节真正变化** 时页面才重新 `apply()` | 跑 `node scripts/build-client.mjs`；若产物与旧字节完全相同，页面不会重载（此时需 toggle 行或由用户重载页面） |
-| profile 的 `cordis.patch.yml` 配置值 | 不会重跑 `apply()` | 需要 toggle 行（或重启 DSH —— **本会话禁止重启**，会杀死会话） |
+| profile 的 `cordis.patch.yml` 配置值 | 不会重跑 `apply()` | 需要 toggle 行（或重启 DSH —— 重启会杀死会话） |
+
+> **v1.0.11 实测更正（2026-09-27，Windows）**：上表第一行原写"端点的**实现**会跟随"，本机证伪。证据与根因见 `docs/ACCEPTANCE.md` §13 与 `docs/TESTING.md` §2.5：`lib/service.js` 已是 44 个 Remote 方法，而 toggle 后 `host-ready.json` 仍是 42（恰好缺 `followActivity`/`clearActivity`）；根因是 `hmr` 行的默认 `ignored` 与 `relative(baseDir, path)` 在 Windows 反斜杠路径上把整棵监视树判成 dot-directory。修复（`scripts/profile-install.mjs` 的 `hmrBlock()`）只在**下一次启动**后生效，因此在那之前改动 host 半边一律按"需要重启"处理。配置值一行不受影响（toggle 有效）。
 
 在结论出来之前，任何"我的改动没生效"的判断都先按 `docs/M0-SPIKE.md` §7.3 复测，不要改代码去适配假象。
 
@@ -862,3 +936,16 @@ UI 与文档一律读它，不得写死 "remote-mount"。
 3. 最终验收（`verify:all`）**串行执行**，并清理 `NODE_OPTIONS`/`NODE_V8_COVERAGE` 等注入变量，只保留必要项。
 4. 出现"某文件卡住"时，**先怀疑并发**再怀疑句柄泄漏——但两者都要查（sp2 同时确实修掉了一个假时钟导致的真挂起：测试自身在未推进的定时器上 `await`）。
 5. **不要再为了让套件"能跑完"而删除或跳过测试**；若某测试确实慢，先测量再优化（例如把它降级到 `test:perf` 层）。
+
+### R10 agent 活动镜像的边界与文档纪律（v1.0.11 新增）
+
+§4.7 的镜像**是有界视图，不是日志**。它只在 host 进程内存里保留最近若干条记录、每条若干字节（§6 `activity.*`），**不落盘、不脱敏、不承诺跨重载或进程重启存活**；durable 且脱敏的记录是审计文件（§4.6，JSONL）。需要"事后追查"时读审计，不读镜像。由此：
+
+1. **不得**把镜像当作审计证据、导出源或"命令历史的真源"：它可以随时被 `clearActivity`、被环预算淘汰、或在卸载时随 `activity.dispose()` 释放。任何一帧的缺失都**不是**故障。
+2. **淘汰是静默的**（环满时丢弃最老的**已结束**记录，不发帧），只有 `clearActivity` 会发 `activity-reset`。所以客户端**可能比 host 记得更多**，直到重连拿到新的 `activity-snapshot`。这是有意的权衡：每次淘汰都广播会让面板在繁忙会话上抖动。
+3. **`activity-reset` 不承诺保留运行中记录的当前文本**：这些记录仍会以结束时的整条 `end` 帧回来。host 不额外提供"清空只清历史"的语义，视图侧如需区分自行处理。
+4. **不做脱敏是刻意的**：命令把密钥打印到 stdout 时镜像会显示它（它持有的本就是用户自己会话的输出）。若将来要求镜像也脱敏，应在 `handle.chunk()` 入口接 `Redactor`，而不是在各工具调用点各写一遍。
+5. **文档纪律（写作用域）**：
+   - §8.5 的 i18n 键表**只允许列出在 `locale/zh.json` 与 `locale/en.json` 中都已存在**的键——契约门对表内每个键断言"两个 locale 都有"，列出未落地的键会把门直接判红。键表本身由 Lead 独占维护。
+   - §3 出现的帧判别式字面量集合被契约门**逐字钉住**。新增帧（如 §4.7 的三种）只能写在 §4.7 正文；若确实要改 §3，必须**同时**修改 `test/integration/icd-conformance.test.mjs` 中那条断言（SP8 写作用域，需 Lead 批准）。
+   - `docs/ICD.md` 与 `src/protocol.ts` 由 Lead 独占；`docs/DESIGN.md`、`README.md`、`CHANGELOG.md` 的改动必须**逐条对照代码**（工具名、端点名、配置键与默认为准），**不得写入未实现的行为**——包括尚未落地的 UI 细节与尚未合入的修复。

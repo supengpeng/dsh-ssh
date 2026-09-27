@@ -190,6 +190,14 @@ export type Frame =
   | { t: 'state'; sessionId: string; state: SessionState; error?: ErrorInfo }
   | { t: 'audit'; entry: AuditEntry }
   | { t: 'end'; streamId: string; reason: EndReason; error?: ErrorInfo }
+  // ICD §4.7 agent activity. `activity-snapshot` opens the subscription with what
+  // the feed already retained; `activity` carries one lifecycle event; `reset` is
+  // emitted when the retained history is dropped, so no subscriber keeps a view
+  // the host no longer has.
+  | { t: 'activity-snapshot'; activities: ActivityView[] }
+  | { t: 'activity'; phase: 'begin' | 'end'; activity: ActivityView }
+  | { t: 'activity'; phase: 'chunk'; id: string; chunk: ActivityChunk }
+  | { t: 'activity-reset' }
 
 // ---------------------------------------------------------------------------
 // Entities (ICD §4)
@@ -197,6 +205,59 @@ export type Frame =
 
 export type AuthKind = 'password' | 'privateKey' | 'agent'
 export type HostKeyPolicy = 'strict' | 'accept-new' | 'insecure'
+
+/**
+ * What an agent-driven operation was (ICD §4.7).
+ *
+ * The activity mirror exists because every `ssh_*` tool call is invisible in the
+ * session workspace: the client only ever sees the operations *it* started, so a
+ * user watching the 终端 tab sees nothing while the model works. These kinds are
+ * the operations the agent tools can perform, not the wire endpoints.
+ */
+export type ActivityKind = 'exec' | 'upload' | 'download' | 'listDir' | 'stat' | 'connect' | 'disconnect' | 'sessions'
+
+/** Terminal classification of one activity, mirroring the tool's own outcome. */
+export type ActivityStatus = 'running' | 'ok' | 'error' | 'timeout' | 'cancelled' | 'refused'
+
+/** Which stream a chunk belongs to; `info` is the plugin's own narration. */
+export type ActivityChannel = 'stdout' | 'stderr' | 'info'
+
+export interface ActivityChunk {
+  channel: ActivityChannel
+  text: string
+}
+
+/**
+ * One activity as the UI renders it.
+ *
+ * `segments` is the transcript in arrival order and is capped by the feed:
+ * `truncated` says whether bytes were dropped, so a short transcript is never
+ * mistaken for a command that produced little output. Segments rather than one
+ * string because the channel is presentational — a `stderr` run is drawn
+ * differently from `stdout`, and `info` is the plugin's own narration.
+ */
+export interface ActivityView {
+  id: string
+  kind: ActivityKind
+  sessionId: string | null
+  /** `user@host` when the session was known, else null. */
+  target: string | null
+  /** One line naming what ran: the shell command, `local → remote`, the host… */
+  subject: string
+  cwd: string | null
+  label: string | null
+  startedAt: number
+  endedAt: number | null
+  durationMs: number | null
+  status: ActivityStatus
+  exitCode: number | null
+  signal: string | null
+  /** Machine-readable failure code (`SSH_*`) when the call failed or was refused. */
+  code: string | null
+  note: string | null
+  segments: ActivityChunk[]
+  truncated: boolean
+}
 
 export interface AuditEntry {
   at: string
