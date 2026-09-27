@@ -31,7 +31,19 @@
 - **唯一的外部真值源不再在 CI 上"静默跳过却报绿"**：`test/integration/openssh-interop.test.mjs` 原先硬编码 Windows `ssh-keygen` 路径，Linux CI 上 `existsSync` 恒为 false ⇒ 整文件 skip 且 `node --test` exit 0。现改为**跨平台候选探测**（仅在 `ENOENT` 时判"不存在"，其余失败都证明二进制跑起来了；含 `DSH_SSH_SSH_KEYGEN` 逃生口），并新增 CI 步骤断言该层**确实执行**（本机实测 5/5、skipped 0）。
 - **"整层全 skip"不再记为 PASS**：`scripts/verify-all.mjs` 现解析每层 `ℹ tests/pass/skipped`，当 `pass === 0 && skipped > 0` 时判为 **skipped 并计入失败**，汇总单列 `zero-execution layers (a green exit code here would have been a lie)`，头部打印 `npm test` 未覆盖的层（integration/e2e/perf）。新增 `test/unit/verify-all-reporting.test.mjs`（16 例，含"部分 skip 仍是 PASS"的对照）。
 
-### Verified（2026-09-27 最终：十条验收全部通过，含 UI 实测）
+### Changed（web 端：安装、验收与 CI 门禁）
+- **`scripts/profile-install.mjs` 现在同时支持两种装载路线**，因为两个 profile 的形态不同：`desktop`（Electron 应用）用 **patch 路线**（在 patch 层插入托管 Loader 行），`web`（`dsh web`）用 **bundles 路线**（写进 `dsh.profile.bundles`，再由 patch 层按 id 启用——物化行是 `disabled: true`，所以必须有一条启用覆盖）。新增：
+  - `--profile <名字或路径>`：裸名字解析到 `$DSH_HOME/profiles/<name>`（此前只接受目录路径）。**注意**：修掉了一个真实缺陷——解析回退路径用了未导入的 `homedir`，即"未设 `DSH_HOME`"的用户会直接抛错（本机因设了该变量而短路，故此前未暴露）。
+  - `--use-bundles`：走 bundles 路线，写 bundle 条目 + 启用覆盖，并**移除** patch 层的 insert 块（两条路线各只引入一行）。
+  - `--install-deps`：编辑完 `package.json` 后**代为在 profile 目录执行 `pnpm install`**——README 里那句"或让脚本代为执行"此前并无对应能力。
+  - `--check`：报告并**在真有问题时非零退出**。新增三项诊断：路线判定、双路线告警、以及**组成健康检查**（跑 `dsh --profile <name> --dump-config`，要求恰好一条插件行）。**刻意分级**：Electron 独占的 profile 无法被 CLI 内省 → 记为"not checked"而**不是**失败；两条路线并存 → 告警而**不是**失败。一个会在正常 profile 上喊狼来了的检查，只会训练人忽略它。
+- **网页端起不来的真因与处置（本机实测）**：`web` profile 的 `dsh.profile.bundles` 里声明了 `@deepseek-ai/dsh-experimental-agent-team-profile` 与 `-auto-review`，二者既不在 CLI 安装里、也不在该 profile 的依赖里，于是**整个 web profile 无法组成**（`cannot resolve profile bundle …`）——与 dsh-ssh 无关却被它拖垮。摘掉这两个 experimental bundle 后组成立即恢复（`dsh --profile web --dump-config` → exit 0，729 行，`dsh-ssh` 行唯一且带完整 config）。
+- **`README.md` §1 重写为"两种 profile"的安装路径**：桌面端 / 网页端各自一段、路线差异表、`--check` 验收、web 端故障排查（bundle 解析失败、路线缺失、重建 `lib/client.js` 的时机）、以及常用命令。补上此前缺失的"装到哪个 profile"这一前提。
+- **CI 给 web 半边一个具名门禁**（`.github/workflows/ci.yml`）：新步骤 `Web half — the client bundle mounts into the sidebar slots`，跑 `test/client/web-mount.test.mjs`。该文件断言三件事：①bundle 以 manifest 的包名注册自身、且**唯一外部依赖是 `react`**（内部模块 id 由构建 banner 列出后做减法得到，而不是把 `ssh.*` 误当外部）；②**manifest 的 `tabId` 就是 bundle 为标签体注册的 key**（只改一侧即红）；③`apply()` 确实挂上标签体与标题槽位，且在 `slots` 服务缺席时不把异常抛回 loader。`panelIcon` **不**在此断言内——那是平台自己放置的槽位，插件并不注册它。
+  - **为什么不启真浏览器**：CI 里没有可装载插件的 DSH web 壳，而自造一个 mock 只能证明 mock。真正的端到端检查是 `profile-install.mjs --check` 跑在真实 profile 上（README §1.3）；步骤注释里写明了这条边界。
+  - **变异验证**：把 manifest 的 `tabId` 从 `ssh` 改成 `sshX`（模拟只改一侧）→ 该用例**立即失败**；还原后 3/3 通过。
+
+
 - 用户完成全部十条验收走查：**文件页签**「进目录：切换过去了，也可以回到上一层」「上传：可以发出，传输条出现进度」「也能下载」——console 证据 `files: navigate`、`rpc stream sshPlugin/upload` → `upload open`、`rpc stream sshPlugin/download {remotePath, localPath}` → `download open { hostStreamId: "st_01M3G4FSGFZD0XA96C9993KCAF" }`，6938 B 落地 `C:\Users\<user>\.dsh\cordis.patch.yml.bak-preset-standard-20260925-222753`；GUI 内 `top` 与多会话/亮暗主题为用户走查确认。
 - **证据边界**：100 MiB 级传输闭环于引擎/工具层（真机 100.0 MiB 实测）；UI 侧为小文件实测，不宣称“UI 端完成 100 MiB 传输”。已知缺口清单（`serverBanner`、`@revoked`/问题级 `policy`、lint warnings 等）**保持有效，不因全通过而删除**。
 ### Verified（2026-09-27：UI 全链路在真机实测打通）
