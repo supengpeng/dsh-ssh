@@ -156,14 +156,66 @@ test('a @revoked entry is refused even when the key matches', async () => {
   assert.equal(outcome.ok, false)
   assert.equal(outcome.code, 'SSH_HOSTKEY_MISMATCH')
   assert.match(String(outcome.detail), /revoked/)
+  assert.equal(outcome.revoked, true, 'the flag the connection layer turns into a hard failure')
 })
 
-test('a different key type for a known host is reported as unknown, not changed', async () => {
+// SEMANTICS FLIP (F-SEC-04): before this change the assertion below was the
+// opposite — a key of an unpinned *type* was reported as `unknown`, which let a
+// second algorithm obtain trust-on-first-use on a host whose key was already
+// pinned and write the wrong key into known_hosts. `changed` is the fix's goal,
+// not a regression: see RECON-BRIEF/`_evidence/sec.md` F-SEC-04.
+test('a different key type for a known host is a change, not a new host', async () => {
   const file = tempFile(knownHostsLine('h.example', 22, 'ssh-rsa', RSA_A) + '\n')
-  const verifier = verifierAt(file, { policy: 'strict' })
-  const outcome = await verifier.verify({ host: 'h.example', port: 22, keyType: 'ssh-ed25519', key: KEY_A })
-  assert.equal(outcome.ok, false)
-  assert.equal(outcome.code, 'SSH_HOSTKEY_UNKNOWN', 'a first-seen key type is a new key, not a replaced one')
+  const before = readFileSync(file, 'utf8')
+  for (const policy of ['strict', 'accept-new']) {
+    const verifier = verifierAt(file, { policy })
+    const outcome = await verifier.verify({ host: 'h.example', port: 22, keyType: 'ssh-ed25519', key: KEY_A })
+    assert.equal(outcome.ok, false, `${policy} must refuse a key of an unpinned type for a host it already knows`)
+    assert.equal(outcome.code, 'SSH_HOSTKEY_MISMATCH', 'an unpinned algorithm is a replaced key, not a first sighting')
+    assert.equal(outcome.knownHostsMatch, 'changed')
+    assert.equal(outcome.fingerprint, FP_A, 'the presented key is reported, not the stored one')
+    assert.equal(outcome.revoked, undefined, 'a type change is not a revocation: the prompt path stays available')
+  }
+  assert.equal(readFileSync(file, 'utf8'), before, 'a change is never remembered, not even under accept-new')
+})
+
+test('an @revoked entry for one key type blocks another key type for the same host', async () => {
+  const file = tempFile(`@revoked h.example ssh-ed25519 ${KEY_A.toString('base64')}\n`)
+  const before = readFileSync(file, 'utf8')
+  const outcome = await verifierAt(file, { policy: 'accept-new' }).verify({ host: 'h.example', port: 22, keyType: 'ssh-rsa', key: RSA_A })
+  assert.equal(outcome.ok, false, 'revocation is host-scoped, not algorithm-scoped')
+  assert.equal(outcome.code, 'SSH_HOSTKEY_MISMATCH')
+  assert.equal(outcome.knownHostsMatch, 'changed')
+  assert.equal(outcome.fingerprint, FP_RSA_A)
+  assert.match(String(outcome.detail), /revoked/)
+  assert.equal(outcome.revoked, true, 'another algorithm must not be able to dodge a revocation')
+  assert.equal(readFileSync(file, 'utf8'), before, 'a revoked host must never gain a second entry')
+})
+
+test('a revoked same-type key is still rejected', async () => {
+  const file = tempFile(`@revoked h.example ssh-ed25519 ${KEY_A.toString('base64')}\n`)
+  const before = readFileSync(file, 'utf8')
+  const verifier = verifierAt(file, { policy: 'accept-new' })
+  const revokedBytes = await verifier.verify({ host: 'h.example', port: 22, keyType: 'ssh-ed25519', key: KEY_A })
+  assert.equal(revokedBytes.ok, false, 'the revoked key is refused even though it matches byte for byte')
+  assert.equal(revokedBytes.code, 'SSH_HOSTKEY_MISMATCH')
+  assert.equal(revokedBytes.knownHostsMatch, 'changed')
+  assert.match(String(revokedBytes.detail), /revoked/)
+  assert.equal(revokedBytes.revoked, true)
+  const otherBytes = await verifier.verify({ host: 'h.example', port: 22, keyType: 'ssh-ed25519', key: KEY_B })
+  assert.equal(otherBytes.ok, false, 'no key of a revoked host is accepted')
+  assert.match(String(otherBytes.detail), /revoked/)
+  assert.equal(otherBytes.revoked, true)
+  assert.equal(readFileSync(file, 'utf8'), before)
+})
+
+test('a @revoked entry for another host does not block this one', async () => {
+  const file = tempFile(`@revoked other.example ssh-ed25519 ${KEY_A.toString('base64')}\n`)
+  const outcome = await verifierAt(file, { policy: 'accept-new' }).verify({ host: 'h.example', port: 22, keyType: 'ssh-ed25519', key: KEY_A })
+  assert.equal(outcome.ok, true, 'revocation must not leak across hosts')
+  assert.equal(outcome.knownHostsMatch, 'unknown')
+  assert.equal(outcome.remembered, true)
+  assert.equal(outcome.revoked, undefined)
 })
 
 // ---------------------------------------------------------------------------
@@ -191,6 +243,25 @@ test('accept-new writes [host]:port entries for a non-default port', async () =>
   const verifier = verifierAt(file, { policy: 'accept-new' })
   await verifier.verify({ host: 'h.example', port: 2222, keyType: 'ssh-ed25519', key: KEY_A })
   assert.equal(readFileSync(file, 'utf8'), `[h.example]:2222 ssh-ed25519 ${KEY_A.toString('base64')}\n`)
+})
+
+test('a genuinely unknown host is still accepted under accept-new and remembered', async () => {
+  // The file knows a *different* host: recognising a host is host-scoped, so this
+  // one must still take the trust-on-first-use path.
+  const file = tempFile(knownHostsLine('other.example', 22, 'ssh-rsa', RSA_A) + '\n')
+  const outcome = await verifierAt(file, { policy: 'accept-new' }).verify({ host: 'h.example', port: 22, keyType: 'ssh-ed25519', key: KEY_A })
+  assert.equal(outcome.ok, true, 'an entry for another host must not make this host "known"')
+  assert.equal(outcome.knownHostsMatch, 'unknown')
+  assert.equal(outcome.remembered, true)
+  const text = readFileSync(file, 'utf8')
+  assert.equal(text.split('\n').filter(Boolean).length, 2, 'the first-seen key is appended next to the other host')
+  assert.ok(text.includes(knownHostsLine('h.example', 22, 'ssh-ed25519', KEY_A)))
+  const again = await verifierAt(file, { policy: 'accept-new' }).verify({ host: 'h.example', port: 22, keyType: 'ssh-ed25519', key: KEY_A })
+  assert.equal(again.knownHostsMatch, 'exact', 'the appended key is the one that is pinned')
+
+  const strictFile = tempFile(knownHostsLine('other.example', 22, 'ssh-rsa', RSA_A) + '\n')
+  const strict = await verifierAt(strictFile, { policy: 'strict' }).verify({ host: 'h.example', port: 22, keyType: 'ssh-ed25519', key: KEY_A })
+  assert.equal(strict.code, 'SSH_HOSTKEY_UNKNOWN', 'strict still reports a genuinely unknown host as unknown')
 })
 
 test('a port-22 entry written as [host]:22 is still matched', async () => {

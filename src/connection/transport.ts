@@ -177,6 +177,34 @@ export async function decideHostKey(
     return true
   }
 
+  // `@revoked` is the operator's explicit "never trust this key", so it is a hard
+  // failure like OpenSSH's — never the ICD §4.3 question. Offering the prompt
+  // would let a user accept a revoked key for the session (and the accept path
+  // below would then remember it), which is exactly what revocation forbids.
+  //
+  // The flag is declared (optionally) on the port's negative branch in
+  // ./types.ts, so no narrowing view is needed here; it stays optional there
+  // because the shared test doubles have no `@revoked` notion at all.
+  if (verdict.revoked === true) {
+    const revoked: HostKeyQuestion = {
+      host,
+      port,
+      keyType,
+      fingerprint: verdict.fingerprint === '' ? fingerprint : verdict.fingerprint,
+      knownHostsMatch: verdict.knownHostsMatch === 'changed' ? 'changed' : 'unknown',
+    }
+    report({ keyType, fingerprint: revoked.fingerprint, knownHostsMatch: revoked.knownHostsMatch, accepted: false })
+    logger.error(`host key for ${host}:${port} is @revoked in known_hosts; refusing without prompting`)
+    throw hostKeyRejection(
+      verdict.code,
+      verdict.knownHostsMatch,
+      revoked,
+      '@revoked',
+      undefined,
+      `the host key of ${host}:${port} is marked @revoked in known_hosts`,
+    )
+  }
+
   const question: HostKeyQuestion = {
     host,
     port,
@@ -236,11 +264,19 @@ function hostKeyRejection(
   question: HostKeyQuestion,
   reason: string,
   cause?: unknown,
+  /**
+   * Overrides the generic message. Used by the `@revoked` refusal so the audit
+   * line (which records `code` and `message`, not `details`) says *why* the key
+   * was refused; every other caller keeps the shared wording, and no caller
+   * passes anything but host, port and prose here.
+   */
+  message?: string,
 ): SshError {
   const text =
-    code === 'SSH_HOSTKEY_MISMATCH'
+    message ??
+    (code === 'SSH_HOSTKEY_MISMATCH'
       ? `the host key of ${question.host}:${question.port} does not match known_hosts`
-      : `the host key of ${question.host}:${question.port} is not in known_hosts`
+      : `the host key of ${question.host}:${question.port} is not in known_hosts`)
   return new SshError(code, text, {
     details: {
       host: question.host,

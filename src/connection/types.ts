@@ -283,6 +283,15 @@ export interface KnownHostsVerifierPort {
         code: 'SSH_HOSTKEY_UNKNOWN' | 'SSH_HOSTKEY_MISMATCH'
         fingerprint: string
         knownHostsMatch: 'unknown' | 'exact' | 'changed'
+        /**
+         * Set when the refusal came from an `@revoked` entry rather than from a
+         * fingerprint change. Optional on purpose: the shared test doubles and
+         * `known-hosts.ts`'s other callers predate it and stay structurally
+         * assignable. `connection/transport.ts` turns a set flag into a hard
+         * failure instead of the ICD §4.3 question — revocation offers no
+         * session-only acceptance.
+         */
+        revoked?: true
       }
   >
   remember(q: { host: string; port: number; keyType: string; key: Buffer }): Promise<void>

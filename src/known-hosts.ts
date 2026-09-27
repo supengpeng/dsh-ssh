@@ -25,11 +25,24 @@
  *   | `accept-new` | accept **and** add to `known_hosts`            | refuse      |
  *   | `insecure`   | accept (no store access at all)                | accept      |
  *
+ * Two rules widen what "changed" means, and both are deliberate departures from a
+ * naively per-algorithm reading of `known_hosts` — recorded here because the file
+ * format no longer explains the policy on its own:
+ *
+ *   - **A new key type for a host we already know is a change, not a new host.**
+ *     Entries are pinned per algorithm, so without this rule a server — or anyone
+ *     able to present a second algorithm — would obtain trust-on-first-use for a
+ *     host whose key is already pinned, and that wrong key would be written to the
+ *     file. Only a host with no entry at all is `unknown`.
+ *   - **`@revoked` is a statement about the host, not about one algorithm.** Any
+ *     `@revoked` line naming this host refuses every key type for it, whichever
+ *     algorithm the server presents. Revocation is therefore checked *before* the
+ *     key-type filter: a revoked host cannot be reached by switching algorithms.
+ *
  * A changed key is refused by every policy: `accept-new` is precisely "trust on
- * first use", not "trust on every use". A key under an `@revoked` marker is
- * always refused. Verification never throws — the caller turns a negative answer
- * into `SSH_HOSTKEY_UNKNOWN` / `SSH_HOSTKEY_MISMATCH` and, for a mismatch, into
- * the ICD §4.3 `pendingHostKey` prompt.
+ * first use", not "trust on every use". Verification never throws — the caller
+ * turns a negative answer into `SSH_HOSTKEY_UNKNOWN` / `SSH_HOSTKEY_MISMATCH` and,
+ * for a mismatch, into the ICD §4.3 `pendingHostKey` prompt.
  */
 
 import { createHash, createHmac, randomBytes } from 'node:crypto'
@@ -49,6 +62,16 @@ export interface HostKeyRefusal {
   knownHostsMatch: KnownHostsMatch
   /** Short, value-free explanation for logs and `details`. */
   detail?: string
+  /**
+   * Set only when the refusal comes from an `@revoked` line naming this host.
+   *
+   * Revocation is the operator's explicit "never trust this", so the caller must
+   * fail the connection outright instead of offering the ICD §4.3 prompt: a
+   * prompt would downgrade revocation to a suggestion the user can wave through
+   * for the session. A machine-readable flag is used rather than a substring test
+   * on {@link detail}, which is prose and free to change.
+   */
+  revoked?: true
 }
 
 export interface HostKeyAcceptance {
@@ -324,6 +347,26 @@ export class KnownHostsVerifierImpl implements KnownHostsVerifier {
 
     const candidates = lookupCandidates(q.host, q.port)
     const entries = this.load()
+
+    // ── 1. Revocation, across every key type, before anything else ────────────
+    // `@revoked` names a host, not an algorithm: a server that can present a
+    // second key type must not be able to walk past a revoked entry, and the
+    // revoked key itself must stay refused. Testing the marker first keeps this
+    // pass O(1) per entry for the common file that carries no markers at all.
+    for (const entry of entries) {
+      if (!entry.markers.includes('@revoked')) continue
+      if (!entryMatchesHost(entry, candidates)) continue
+      return {
+        ok: false,
+        code: 'SSH_HOSTKEY_MISMATCH',
+        fingerprint: presented,
+        knownHostsMatch: 'changed',
+        detail: 'this host is marked @revoked in known_hosts: every key type for it is refused',
+        revoked: true,
+      }
+    }
+
+    // ── 2. Entries of the presented key type (the original fast path) ─────────
     let changed = false
     for (const entry of entries) {
       if (entry.keyType !== q.keyType) continue
@@ -331,15 +374,6 @@ export class KnownHostsVerifierImpl implements KnownHostsVerifier {
       if (!buffersEqual(entry.key, q.key)) {
         changed = true
         continue
-      }
-      if (entry.markers.includes('@revoked')) {
-        return {
-          ok: false,
-          code: 'SSH_HOSTKEY_MISMATCH',
-          fingerprint: presented,
-          knownHostsMatch: 'changed',
-          detail: 'this key is marked @revoked in known_hosts',
-        }
       }
       return { ok: true, knownHostsMatch: 'exact', fingerprint: presented, policy }
     }
@@ -351,6 +385,23 @@ export class KnownHostsVerifierImpl implements KnownHostsVerifier {
         fingerprint: presented,
         knownHostsMatch: 'changed',
         detail: 'known_hosts already holds a different key of this type for the host',
+      }
+    }
+
+    // ── 3. Another key type for a host we already know is a change ────────────
+    // Only reached when no entry of the presented type names this host — exactly
+    // the case this guard exists for — so the cross-type host match (an HMAC per
+    // hashed entry) is not paid on the exact-match or same-type-mismatch paths.
+    // Every entry that reaches the body here is of a different key type, because
+    // step 2 already rejected the matching ones.
+    for (const entry of entries) {
+      if (!entryMatchesHost(entry, candidates)) continue
+      return {
+        ok: false,
+        code: 'SSH_HOSTKEY_MISMATCH',
+        fingerprint: presented,
+        knownHostsMatch: 'changed',
+        detail: 'known_hosts holds a key for this host under another key type: a new key type is a change, not a new host',
       }
     }
 

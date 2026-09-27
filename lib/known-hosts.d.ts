@@ -25,11 +25,24 @@
  *   | `accept-new` | accept **and** add to `known_hosts`            | refuse      |
  *   | `insecure`   | accept (no store access at all)                | accept      |
  *
+ * Two rules widen what "changed" means, and both are deliberate departures from a
+ * naively per-algorithm reading of `known_hosts` — recorded here because the file
+ * format no longer explains the policy on its own:
+ *
+ *   - **A new key type for a host we already know is a change, not a new host.**
+ *     Entries are pinned per algorithm, so without this rule a server — or anyone
+ *     able to present a second algorithm — would obtain trust-on-first-use for a
+ *     host whose key is already pinned, and that wrong key would be written to the
+ *     file. Only a host with no entry at all is `unknown`.
+ *   - **`@revoked` is a statement about the host, not about one algorithm.** Any
+ *     `@revoked` line naming this host refuses every key type for it, whichever
+ *     algorithm the server presents. Revocation is therefore checked *before* the
+ *     key-type filter: a revoked host cannot be reached by switching algorithms.
+ *
  * A changed key is refused by every policy: `accept-new` is precisely "trust on
- * first use", not "trust on every use". A key under an `@revoked` marker is
- * always refused. Verification never throws — the caller turns a negative answer
- * into `SSH_HOSTKEY_UNKNOWN` / `SSH_HOSTKEY_MISMATCH` and, for a mismatch, into
- * the ICD §4.3 `pendingHostKey` prompt.
+ * first use", not "trust on every use". Verification never throws — the caller
+ * turns a negative answer into `SSH_HOSTKEY_UNKNOWN` / `SSH_HOSTKEY_MISMATCH` and,
+ * for a mismatch, into the ICD §4.3 `pendingHostKey` prompt.
  */
 import type { HostKeyPolicy } from './protocol.js';
 import type { Redactor } from './redact.js';
@@ -42,6 +55,16 @@ export interface HostKeyRefusal {
     knownHostsMatch: KnownHostsMatch;
     /** Short, value-free explanation for logs and `details`. */
     detail?: string;
+    /**
+     * Set only when the refusal comes from an `@revoked` line naming this host.
+     *
+     * Revocation is the operator's explicit "never trust this", so the caller must
+     * fail the connection outright instead of offering the ICD §4.3 prompt: a
+     * prompt would downgrade revocation to a suggestion the user can wave through
+     * for the session. A machine-readable flag is used rather than a substring test
+     * on {@link detail}, which is prose and free to change.
+     */
+    revoked?: true;
 }
 export interface HostKeyAcceptance {
     ok: true;
