@@ -8,11 +8,12 @@
  */
 
 import assert from 'node:assert/strict'
-import { test } from 'node:test'
+import { afterEach, beforeEach, test } from 'node:test'
 
 import { createConnectionPool, scanForSecrets, stripSecrets } from '../../lib/connection/index.js'
 import { createSessionRegistry } from '../../lib/sessions.js'
 import { SshError } from '../../lib/protocol.js'
+import { holdLoop } from '../support/loop.mjs'
 import {
   createFakeChannel,
   createFakeClient,
@@ -49,6 +50,20 @@ function poolWith(t, options = {}) {
 
 const profile = (overrides = {}) =>
   makeProfile({ auth: 'password', secrets: { password: PASSWORD }, ...overrides })
+
+// Several cases below await a real deadline, a real keepalive interval or a real
+// grace period, and every timer in this plugin is `unref`'d on purpose, so a test
+// that awaits one has nothing keeping the loop alive. Node 20/22's runner then
+// ends the file with "Promise resolution is still pending but the event loop has
+// already resolved", cancelling that case and every case after it; Node 24's
+// runner holds a handle, which is why this only ever failed on CI.
+let loopSentinel
+beforeEach(() => {
+  loopSentinel = holdLoop()
+})
+afterEach(() => {
+  clearTimeout(loopSentinel)
+})
 
 test('passes timeouts, keepalive and credentials to the ssh2 client', async (t) => {
   const client = createFakeClient()

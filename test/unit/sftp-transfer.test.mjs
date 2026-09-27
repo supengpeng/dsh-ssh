@@ -31,6 +31,7 @@ import { test } from 'node:test'
 
 import { buildRanges, durableOffset, resolveTransferOptions, TransferEngine } from '../../lib/sftp/transfer.js'
 import { createFakeHandle } from './sftp-fakes.mjs'
+import { holdLoop } from '../support/loop.mjs'
 
 const KiB = 1024
 const MiB = 1024 * 1024
@@ -212,6 +213,7 @@ test('ranges are contiguous, cover the remainder, and drive the durable offset',
 })
 
 test('a peer that never acknowledges a chunk ends the transfer on the chunk deadline', async (t) => {
+  holdLoop(t)
   const dir = await tmpRoot(t)
   const remoteRoot = join(dir, 'remote')
   await mkdir(remoteRoot, { recursive: true })

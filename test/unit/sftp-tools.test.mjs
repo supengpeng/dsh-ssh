@@ -20,6 +20,7 @@ import { test } from 'node:test'
 import { assertObjectJsonSchema, assertSupportedJsonSchema, validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 
 import { SshError } from '../../lib/protocol.js'
+import { holdLoop } from '../support/loop.mjs'
 import {
   FILES_TOOL_NAMES,
   fileTools,
@@ -241,7 +242,8 @@ test('invalid arguments and unknown sessions are refused without calling the tra
   assert.deepEqual(validateJsonSchemaValue(tool.output.schema, unknown), [])
 })
 
-test('a transfer deadline aborts with a resumable report', async () => {
+test('a transfer deadline aborts with a resumable report', async (t) => {
+  holdLoop(t)
   const { deps } = depsWith({
     transfer: async (request) =>
       await new Promise((resolve, reject) => {
