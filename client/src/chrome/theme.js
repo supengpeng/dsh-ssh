@@ -42,7 +42,7 @@ SSH.define('ssh.chrome.theme', function (SSH) {
     '--dsw-alias-state-idle-primary',
     '--dsw-alias-state-success-primary',
     '--dsw-alias-state-warn-primary',
-    '--dsw-alias-specific-sidebar-fill',
+    '--dsw-specific-sidebar-fill',
   ])
 
   /**

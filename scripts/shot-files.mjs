@@ -64,7 +64,7 @@ const THEMES = {
     '--dsw-alias-state-idle-primary': '#9aa1ad',
     '--dsw-alias-state-success-primary': '#30a46c',
     '--dsw-alias-state-warn-primary': '#f5a524',
-    '--dsw-alias-specific-sidebar-fill': '#f7f8fa',
+    '--dsw-specific-sidebar-fill': '#f7f8fa',
   },
   dark: {
     '--dsw-alias-bg-base': '#1b1d22',
@@ -80,7 +80,7 @@ const THEMES = {
     '--dsw-alias-state-idle-primary': '#6b7280',
     '--dsw-alias-state-success-primary': '#3dd68c',
     '--dsw-alias-state-warn-primary': '#ffb224',
-    '--dsw-alias-specific-sidebar-fill': '#212429',
+    '--dsw-specific-sidebar-fill': '#212429',
   },
 }
 
@@ -159,7 +159,7 @@ ${tokens}
   html, body { margin:0; padding:0; background:var(--dsw-alias-bg-base); }
   /* The right sidebar at its configured default width, with the tab body height. */
   .shell { width:${SIDEBAR_WIDTH}px; height:${PANEL_HEIGHT}px; overflow:hidden;
-    background:var(--dsw-alias-specific-sidebar-fill); border-right:1px solid var(--dsw-alias-border-l1); }
+    background:var(--dsw-specific-sidebar-fill); border-right:1px solid var(--dsw-alias-border-l1); }
   .shell > div { height:100%; }
 ${css}
 </style></head>

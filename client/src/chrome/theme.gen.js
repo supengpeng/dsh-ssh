@@ -98,7 +98,7 @@ SSH.define('ssh.chrome.theme.css', function () {
   min-width: 0;
   padding: 4px 6px;
   border-bottom: 1px solid var(--dsw-alias-border-l1);
-  background: var(--dsw-alias-specific-sidebar-fill, var(--dsw-alias-bg-layer-1));
+  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-layer-1));
 }
 
 .dsh-ssh-tabstrip-inner {
