@@ -1,10 +1,13 @@
 # @local/dsh-ssh · DSH SSH 插件
 
+[![CI](https://github.com/supengpeng/dsh-ssh/actions/workflows/ci.yml/badge.svg)](https://github.com/supengpeng/dsh-ssh/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 在 DSH 右侧边栏里管理 SSH 连接：连接档案、多会话工作区（终端 / 命令 / 文件 / 日志）、SFTP 传输、审计日志，并同时以 Agent 工具的形式暴露给模型。
 
 - **host 半边**：Node + Cordis 插件（`src/**` → `lib/**`），用 `ssh2` 实现连接池、命令执行、PTY 与 SFTP。
 - **client 半边**：自包含懒加载 bundle（`client/src/**` → `lib/client.js`，唯一外部依赖 `react`），注册右侧栏标签与面板，主题全部走 `--dsw-*` token。
-- **文档**：`docs/DESIGN.md`（总体设计）、`docs/ICD.md`（冻结接口契约 v1.0.x）、`docs/M0-SPIKE.md`（传输实测）、`docs/TESTING.md`（分层测试与运行命令）、`docs/DEMO.md`（验收走查）、`docs/REAL-TARGET.md`（真机信息，不含密码）。
+- **文档**：`docs/DESIGN.md`（总体设计）、`docs/ICD.md`（冻结接口契约 v1.0.x）、`docs/M0-SPIKE.md`（传输实测）、`docs/TESTING.md`（分层测试与运行命令）、`docs/DEMO.md`（验收走查）、`docs/REAL-TARGET.md`（真机信息，不含密码）、`docs/SCREENSHOTS.md`（截图工具链：为何布局缺陷必须靠真实浏览器）。
 
 ---
 

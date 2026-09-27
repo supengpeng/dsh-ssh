@@ -48,6 +48,26 @@ node scripts/verify-all.mjs --list          # 列出层与超时
 
 **禁止**为了让套件跑完而删除/跳过测试。确实慢就先测量（`test:perf` 层）再优化；较重的规模用环境变量降级（见 §5）。
 
+#### 2.2.1 「整套挂住」的一个已复现成因：上次中断留下的进程
+
+实测记录（2026-09-27）：`test/unit/**` 聚合运行两次 **>10 分钟不结束**，但——
+
+| 观察 | 结果 |
+|---|---|
+| 34 个文件**逐个**跑 | **全部通过**，最慢 `sftp-adapter` 16.7s、`sftp-transfer` 10.6s，合计约 75s |
+| 残留进程状态 | CPU 仅 0.6s / 0.3s ⇒ **在等待，不是在自旋** |
+| 清理残留 `node` 进程后**重跑聚合** | **51.3s 正常结束**（540 tests / 537 pass / 0 fail / 3 skipped） |
+
+结论：**不是套件缺陷，而是中断/被杀掉的运行留下进程占着资源**（sshd 桩的监听端口），使下一次聚合运行停等。
+
+判据与处置：
+
+1. **判据**：进程 **CPU 极低 + 时间很长** ⇒ 等待；**CPU 飙高** ⇒ 死循环。二者病因不同。
+2. **处置**：先清残留（`Get-Process node | Where-Object { $_.StartTime -lt (Get-Date).AddMinutes(-3) } | Stop-Process -Force`），再重跑一次；**不要在残留进程还在时下结论**。
+3. **预防**：中断测试后**务必**确认无残留进程；`verify-all` 的并发自检只覆盖"另一份测试在跑"，覆盖不了"上次的孤儿进程"。
+
+这条与 §2.2 正文是同一条纪律的两面：**并发**与**孤儿进程**都会表现为"套件卡住"。
+
 ### 2.3 本地靶机（无 Docker / 无 WSL）
 本机没有 Docker、没有 WSL，因此"对真实 Linux 服务器验证"在自动化里由 `test/support/sshd.mjs` 承担：基于 `ssh2` 的 **Server API** 搭出的真协议 sshd（真实 TCP/密钥交换/加密/通道/SFTP 子系统），只有**命令执行**是在进程内解释的（`test/support/minish.mjs`，不依赖 Windows 的 `cmd`）。API 与命令集见 `test/support/README.md`，自测见 `test/integration/sshd-double.test.mjs`（13/13）。
 
@@ -156,3 +176,5 @@ pnpm test:real            # 或 node scripts/verify-all.mjs --real
 3. 改了 `client/src/**` → 跑过 `node scripts/build-client.mjs` 且 `--check` 通过（产物与源码一致）。
 4. 改了 `src/**` → `tsc --noEmit` 0 错，且没有把 `lib/**` 手改（产物只由构建生成）。
 5. 文档同步：`README.md`（配置/FAQ）、`docs/TESTING.md`（命令/实测）、`CHANGELOG.md`（变更条目）。
+6. 改了**布局 / 可见性**（`client/src/session/**` 的样式或结构）→  组件测试**证明不了几何**（linkedom 无布局引擎，"元素存在 ≠ 元素可见"），必须补一张真实浏览器截图：`npm run docs:shots`（见 [`SCREENSHOTS.md`](./SCREENSHOTS.md)），并在该文件里更新说明。
+7. 交付前确认**没有孤儿测试进程**（见 §2.2.1）：残留进程会让下一次聚合运行停等，看起来像"套件挂了"。
