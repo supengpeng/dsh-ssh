@@ -59,7 +59,7 @@ import {
   writeExactly,
   type LocalEntry,
 } from './local.js'
-import { localBasename, localDirname, localJoin, remoteBasename, remoteDirname, remoteJoin, remoteNormalize } from './paths.js'
+import { isProtectedLocalPath, localBasename, localDirname, localJoin, remoteBasename, remoteDirname, remoteJoin, remoteNormalize } from './paths.js'
 import { ProgressReporter, type ProgressClock } from './progress.js'
 
 import type {
@@ -260,6 +260,11 @@ export function resolveTransferOptions(
     progressByteThreshold: clampInt(extra.progressByteThreshold, DEFAULT_PROGRESS_BYTE_THRESHOLD, 1, Number.MAX_SAFE_INTEGER),
     maxDepth: clampInt(extra.maxDepth, DEFAULT_MAX_DEPTH, 1, 512),
     offsetWrite: extra.offsetWrite ?? 'auto',
+    // Safety defaults: the gate is on unless a composition turns it off, and the
+    // protected list is empty only when the caller supplied none (tests, or an
+    // embedder that has its own policy).
+    confirmDangerous: defaults.confirmDangerous ?? true,
+    protectedLocalPaths: defaults.protectedLocalPaths ?? [],
   }
 }
 
@@ -630,6 +635,14 @@ export class TransferEngine {
       ...(request.verify === undefined ? {} : { verify: request.verify }),
       ...(request.overwrite === undefined ? {} : { overwrite: request.overwrite }),
     })
+    // A request that can read or write one of the plugin's own trust anchors is
+    // refused before any filesystem work happens — for both directions, because
+    // an upload of `known_hosts` leaks it just as a download onto it corrupts it.
+    if (isProtectedLocalPath(request.localPath, opts.protectedLocalPaths)) {
+      throw new SshError('SSH_CFG_INVALID', `refusing to touch a file the plugin relies on: ${request.localPath}`, {
+        details: { localPath: request.localPath, reason: 'protected-path', direction: request.direction },
+      })
+    }
     const reporter = new ProgressReporter({
       intervalMs: opts.progressIntervalMs,
       byteThreshold: opts.progressByteThreshold,
@@ -966,9 +979,17 @@ export class TransferEngine {
     // handle, downloads only need positional local writes.
     const canResume = direction === 'download' || capabilities.canOffsetWrite
     if (opts.resume && canResume && destinationSize < sourceSize) {
-      return { resumedFrom: destinationSize, skip: false, path }
-    }
-    if (opts.resume && destinationSize === sourceSize) {
+      // Appending into a destination we did not create is only safe when the
+      // caller said so. Sizes alone cannot tell a truncated download from an
+      // unrelated file that happens to be smaller, and treating the latter as a
+      // partial transfer silently corrupts it — so `confirmDangerous` (default
+      // true) routes the decision through the conflict path below, which either
+      // has an explicit `overwrite: true` or raises SSH_SFTP_TARGET_EXISTS for
+      // the caller to confirm and re-send (ICD §4.5).
+      if (!opts.confirmDangerous || opts.overwrite) {
+        return { resumedFrom: destinationSize, skip: false, path }
+      }
+    } else if (opts.resume && destinationSize === sourceSize) {
       // Already the right length: nothing to move, `verify` decides whether it is
       // actually correct (it is the only check that can tell).
       return { resumedFrom: destinationSize, skip: false, path }

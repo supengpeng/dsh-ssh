@@ -405,6 +405,7 @@ test('resume: an upload continues from the destination size and reports resumedF
     localPath: localFile,
     remotePath: '/payload.bin',
     verify: 'sha256',
+    overwrite: true,
   })
 
   assert.equal(outcome.resumedFrom, MiB, 'the resumed offset is the destination size')
@@ -441,6 +442,7 @@ test('resume: a download continues from the local file size', async (t) => {
     localPath: localFile,
     remotePath: '/payload.bin',
     verify: 'sha256',
+    overwrite: true,
   })
 
   assert.equal(outcome.resumedFrom, 2 * MiB)
@@ -505,12 +507,15 @@ for (const direction of ['upload', 'download']) {
     const destination = direction === 'upload' ? remoteFile : localFile
     assert.equal((await stat(destination)).size, details.resumedFrom)
 
-    // Resuming from that offset produces a byte-identical file.
+    // Resuming from that offset produces a byte-identical file. `overwrite: true`
+    // is what authorises an append under `confirmDangerous` (F-SEC-05): sizes
+    // alone cannot tell this real partial from an unrelated smaller file.
     const resumed = await engineFor().run(handle, {
       direction,
       localPath: localFile,
       remotePath: '/payload.bin',
       verify: 'sha256',
+      overwrite: true,
     })
     assert.equal(resumed.resumedFrom, details.resumedFrom, 'the second run resumes exactly where the first stopped')
     assert.equal(resumed.transferred, size - details.resumedFrom)
@@ -867,6 +872,8 @@ test('a handle without truncate uploads through a single ordered range and stays
     localPath: localFile,
     remotePath: '/payload.bin',
     verify: 'sha256',
+    // Authorises the append of the remaining 3 MiB onto the real 1 MiB partial.
+    overwrite: true,
   })
   assert.equal(outcome.resumedFrom, MiB)
   assert.equal(await sha256File(remoteFile), expected)

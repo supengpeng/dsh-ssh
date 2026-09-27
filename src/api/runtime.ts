@@ -31,6 +31,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 
 import type { ResolvedConfig } from '../config.js'
+import { ActivityFeed } from '../activity/feed.js'
 import { createAuditor, type SshAuditor } from '../audit.js'
 import { createConnectionPool, type ConnectionPool } from '../connection/index.js'
 import { createCredentialResolver, type SshCredentialResolver } from '../credentials.js'
@@ -59,6 +60,7 @@ export interface HostRuntime {
     credentials: SshCredentialResolver
     knownHosts: KnownHostsVerifierImpl
     audit: SshAuditor
+    activity: ActivityFeed
     pool: ConnectionPool
     registry: SessionRegistry
     exec: ExecService
@@ -172,6 +174,22 @@ export async function createHostRuntime(options: CreateHostRuntimeOptions): Prom
 
   const audit = createAuditor({ file: config.auditFile, redactor, logger: log })
 
+  /**
+   * The agent-activity mirror (ICD §4.7).
+   *
+   * Built here, above the endpoint facade and the tools, because both need it:
+   * the facade serves it to the browser and the tools record into it. It is the
+   * one part of the graph that carries raw remote output in memory, which is why
+   * its bounds come from the configuration rather than from a constant here.
+   */
+  const activity = new ActivityFeed({
+    enabled: config.activity.enabled,
+    maxRecords: config.activity.maxRecords,
+    maxRecordBytes: config.activity.maxRecordBytes,
+    maxTotalBytes: config.activity.maxTotalBytes,
+    logger: log,
+  })
+
   const registry = createSessionRegistry({
     maxConcurrentOpsPerSession: config.maxConcurrentOpsPerSession,
     logger: log,
@@ -207,6 +225,10 @@ export async function createHostRuntime(options: CreateHostRuntimeOptions): Prom
       operationTimeoutMs: config.operationTimeoutMs,
       graceKillMs: config.graceKillMs,
     },
+    // Frame count bound on the replay log. Passed through rather than defaulted
+    // here: `0` legitimately means "no count bound", so an explicit value is the
+    // only way to tell "unset" (use FrameWriter's default) from "disabled".
+    replayLimitFrames: config.maxReplayFrames,
     logger: log,
   })
 
@@ -217,6 +239,11 @@ export async function createHostRuntime(options: CreateHostRuntimeOptions): Prom
       maxConcurrentChunks: config.sftp.maxConcurrentChunks,
       resume: config.sftp.resume,
       verify: config.sftp.verify,
+      // The engine's own safety net (F-SEC-05): implicit append/replace needs an
+      // explicit `overwrite: true`, and the plugin's trust anchors and state
+      // files are out of reach for every transfer, in both directions.
+      confirmDangerous: config.confirmDangerous,
+      protectedLocalPaths: [config.hostKey.knownHostsFile, config.profilesFile, config.auditFile],
       followSymlinks: config.sftp.followSymlinks,
       progressIntervalMs: config.sftp.progressIntervalMs,
     },
@@ -250,6 +277,7 @@ export async function createHostRuntime(options: CreateHostRuntimeOptions): Prom
     credentials,
     knownHosts,
     audit,
+    activity,
     pool,
     registry,
     exec,
@@ -260,7 +288,7 @@ export async function createHostRuntime(options: CreateHostRuntimeOptions): Prom
 
   // 4. the tools registry is opportunistic: `inject: ['tools']` makes it the one
   //    hard dependency of the *shell*, but a tree without it must still load.
-  const tools = registerAgentTools({ ctx, config, exec, pool, registry, transfers, audit, log, api })
+  const tools = registerAgentTools({ ctx, config, exec, pool, registry, transfers, audit, activity, log, api })
 
   const service = new SshPluginService(ctx, config, log.toServiceLogger(), { probeWire: true, api })
 
@@ -268,7 +296,7 @@ export async function createHostRuntime(options: CreateHostRuntimeOptions): Prom
   return {
     service,
     log,
-    parts: { config, redactor, store, credentials, knownHosts, audit, pool, registry, exec, transfers, tools },
+    parts: { config, redactor, store, credentials, knownHosts, audit, activity, pool, registry, exec, transfers, tools },
     async dispose(): Promise<void> {
       if (disposed) return
       disposed = true
@@ -288,6 +316,14 @@ export async function createHostRuntime(options: CreateHostRuntimeOptions): Prom
         tools.dispose()
       } catch (error) {
         log.warn('tool unregistration failed', { reason: messageOf(error) })
+      }
+      // The mirror holds remote output in memory and nothing durable depends on
+      // it: dropping it here is what makes "unload leaves no captured output
+      // behind" true, the same way `credentials.forgetAll()` does for secrets.
+      try {
+        activity.dispose()
+      } catch (error) {
+        log.warn('activity feed dispose failed', { reason: messageOf(error) })
       }
       try {
         await pool.disposeAll('plugin unload')

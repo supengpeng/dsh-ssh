@@ -137,6 +137,16 @@ export interface ResolvedTransferOptions {
   /** Recursion guard: a tree deeper than this is refused, not silently cut. */
   maxDepth: number
   offsetWrite: OffsetWriteMode
+  /**
+   * `config.confirmDangerous`. When true (the default) the engine refuses an
+   * **implicit** append into, or replacement of, an existing non-empty
+   * destination: the caller must say `overwrite: true`, which is the point at
+   * which a human has been asked. Setting it false restores the pre-0.2.1
+   * behaviour and is meant for a caller that confirms elsewhere.
+   */
+  confirmDangerous: boolean
+  /** Local files the transfer engine must never read or write (trust anchors). */
+  protectedLocalPaths: readonly string[]
 }
 
 /** Overrides accepted by the engine; every field falls back to the config. */
@@ -166,6 +176,10 @@ export interface TransferEngineDefaults {
   verify?: TransferVerify
   followSymlinks?: boolean
   progressIntervalMs?: number
+  /** See `ResolvedTransferOptions.confirmDangerous`. Defaults to true. */
+  confirmDangerous?: boolean
+  /** See `ResolvedTransferOptions.protectedLocalPaths`. Defaults to none. */
+  protectedLocalPaths?: readonly string[]
 }
 
 /** One transferred file, as reported in the outcome (and by `listTransfers`). */

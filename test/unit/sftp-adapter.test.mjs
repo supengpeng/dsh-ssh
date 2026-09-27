@@ -335,6 +335,9 @@ test('engine: resume works against a real server (offset write and truncate are 
         localPath: source,
         remotePath: '/tmp/resume.bin',
         verify: 'sha256',
+        // The destination is this transfer's own truncated prefix, so the append
+        // is authorised explicitly (F-SEC-05's `confirmDangerous` gate).
+        overwrite: true,
       })
       assert.equal(outcome.resumedFrom, MiB, 'the engine resumed from the real destination size')
       assert.equal(outcome.transferred, 2 * MiB)
@@ -494,6 +497,9 @@ test('engine: sha256 catches a same-length destination on a real server', async 
           localPath: source,
           remotePath: '/tmp/report.txt',
           verify: 'sha256',
+          // Authorise the resume so the run reaches `verify`; without it the
+          // engine now refuses earlier, before writing anything (F-SEC-05).
+          overwrite: true,
         })
         .then(() => null, (caught) => caught)
       assert.ok(error)

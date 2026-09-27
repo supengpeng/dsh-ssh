@@ -40,4 +40,22 @@ export declare function localJoin(...parts: Array<string | undefined>): string;
 export declare function localDirname(path: string): string;
 /** Final component of a local path. */
 export declare function localBasename(path: string): string;
+/** Absolute path with symlinks/junctions resolved when the target exists. */
+export declare function canonicalLocalPath(path: string): string;
+/**
+ * Whether `candidate` names one of `protectedPaths`.
+ *
+ * Used to keep the plugin's own trust anchors and state out of the transfer
+ * engine's reach: a request that can rewrite `known_hosts` or the audit log has
+ * taken over the very files that make verification and accountability mean
+ * anything. Comparison is case-insensitive on Windows (its filesystem is) and
+ * exact elsewhere.
+ *
+ * Residual, deliberately documented: a symlink or junction pointing at a
+ * protected file that does **not** exist yet cannot be resolved, so the
+ * comparison sees two different absolute paths. Creating such a link already
+ * requires the privileges that make this moot on Windows, and the window only
+ * exists until the anchor file is first written.
+ */
+export declare function isProtectedLocalPath(candidate: string, protectedPaths: readonly string[]): boolean;
 //# sourceMappingURL=paths.d.ts.map

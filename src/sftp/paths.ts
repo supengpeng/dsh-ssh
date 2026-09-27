@@ -8,7 +8,8 @@
  * remember which is which.
  */
 
-import { posix, win32 } from 'node:path'
+import { posix, win32, resolve as resolvePath } from 'node:path'
+import { realpathSync } from 'node:fs'
 
 /** Separator the local filesystem uses in error messages and joins. */
 export const LOCAL_SEP = process.platform === 'win32' ? '\\' : '/'
@@ -86,4 +87,40 @@ export function localDirname(path: string): string {
 /** Final component of a local path. */
 export function localBasename(path: string): string {
   return process.platform === 'win32' ? win32.basename(path) : posix.basename(path)
+}
+
+/** Absolute path with symlinks/junctions resolved when the target exists. */
+export function canonicalLocalPath(path: string): string {
+  const absolute = resolvePath(path)
+  try {
+    // `native` also normalises the 8.3 short form on Windows, so `PROGRA~1` and
+    // `Program Files` compare equal. A missing target throws and we fall back to
+    // the unresolved absolute path — both sides fall back the same way, so the
+    // comparison stays meaningful for a file that does not exist yet.
+    return realpathSync.native(absolute)
+  } catch {
+    return absolute
+  }
+}
+
+/**
+ * Whether `candidate` names one of `protectedPaths`.
+ *
+ * Used to keep the plugin's own trust anchors and state out of the transfer
+ * engine's reach: a request that can rewrite `known_hosts` or the audit log has
+ * taken over the very files that make verification and accountability mean
+ * anything. Comparison is case-insensitive on Windows (its filesystem is) and
+ * exact elsewhere.
+ *
+ * Residual, deliberately documented: a symlink or junction pointing at a
+ * protected file that does **not** exist yet cannot be resolved, so the
+ * comparison sees two different absolute paths. Creating such a link already
+ * requires the privileges that make this moot on Windows, and the window only
+ * exists until the anchor file is first written.
+ */
+export function isProtectedLocalPath(candidate: string, protectedPaths: readonly string[]): boolean {
+  if (protectedPaths.length === 0) return false
+  const fold = (value: string): string => (process.platform === 'win32' ? value.toLowerCase() : value)
+  const target = fold(canonicalLocalPath(candidate))
+  return protectedPaths.some((entry) => entry !== '' && fold(canonicalLocalPath(entry)) === target)
 }

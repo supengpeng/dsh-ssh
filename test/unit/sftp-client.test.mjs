@@ -450,6 +450,9 @@ test('manager.start answers the §4.5 handshake with the resume offset for one f
     direction: 'upload',
     localPath: localFile,
     remotePath: '/payload.bin',
+    // The remote file holds this upload's own 1 MiB prefix; the append needs the
+    // caller's authorisation under `confirmDangerous` (F-SEC-05).
+    overwrite: true,
     sink: { onProgress: (progress) => frames.push(progress) },
   })
   assert.match(started.opId, /^op_/)
