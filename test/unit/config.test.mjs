@@ -7,9 +7,23 @@
  */
 
 import assert from 'node:assert/strict'
+import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 
 import { Config, resolveConfig, resolveDshHome, toPublicConfig } from '../../lib/config.js'
+
+/**
+ * A `DSH_HOME` fixture that is absolute *on the platform running the test*.
+ *
+ * These cases are about the resolution rule — a relative path is anchored to
+ * DSH_HOME, an absolute one is passed through — so hard-coding a Windows literal
+ * asserted the rule only where `C:/x` happens to be absolute. On Linux,
+ * `resolve('C:/dsh-home')` is a *relative* path and picks up the working
+ * directory, which is how three of these tests failed on CI while passing here.
+ */
+const HOME_FIXTURE = process.platform === 'win32' ? 'C:/dsh-home' : '/dsh-home'
+const HOME_NATIVE = resolve(HOME_FIXTURE)
+const CUSTOM_FIXTURE = process.platform === 'win32' ? 'C:/custom' : '/custom'
 
 test('an empty config object resolves every declared key', () => {
   const resolved = resolveConfig(Config({}))
@@ -89,28 +103,32 @@ test('nested objects fill their own defaults', () => {
 })
 
 test('empty paths resolve under DSH_HOME', () => {
-  const resolved = resolveConfig(Config({}), { DSH_HOME: 'C:/dsh-home' })
-  assert.equal(resolved.dshHome, 'C:\\dsh-home')
-  assert.equal(resolved.profilesFile, 'C:\\dsh-home\\dsh-ssh\\profiles.json')
-  assert.equal(resolved.auditFile, 'C:\\dsh-home\\logs\\dsh-ssh\\audit.jsonl')
-  assert.equal(resolved.knownHostsFile, 'C:\\dsh-home\\known_hosts')
+  const resolved = resolveConfig(Config({}), { DSH_HOME: HOME_FIXTURE })
+  assert.equal(resolved.dshHome, HOME_NATIVE)
+  assert.equal(resolved.profilesFile, join(HOME_NATIVE, 'dsh-ssh', 'profiles.json'))
+  assert.equal(resolved.auditFile, join(HOME_NATIVE, 'logs', 'dsh-ssh', 'audit.jsonl'))
+  assert.equal(resolved.knownHostsFile, join(HOME_NATIVE, 'known_hosts'))
 })
 
 test('explicit paths win over the DSH_HOME default', () => {
   const resolved = resolveConfig(
-    Config({ profilesFile: 'C:/custom/profiles.json', auditFile: 'C:/custom/audit.jsonl', hostKey: { knownHostsFile: 'C:/custom/kh' } }),
-    { DSH_HOME: 'C:/dsh-home' },
+    Config({
+      profilesFile: `${CUSTOM_FIXTURE}/profiles.json`,
+      auditFile: `${CUSTOM_FIXTURE}/audit.jsonl`,
+      hostKey: { knownHostsFile: `${CUSTOM_FIXTURE}/kh` },
+    }),
+    { DSH_HOME: HOME_FIXTURE },
   )
   // An already-absolute path is passed through verbatim: whatever separator
   // style the operator wrote is preserved rather than silently rewritten.
-  assert.equal(resolved.profilesFile, 'C:/custom/profiles.json')
-  assert.equal(resolved.auditFile, 'C:/custom/audit.jsonl')
-  assert.equal(resolved.knownHostsFile, 'C:/custom/kh')
+  assert.equal(resolved.profilesFile, `${CUSTOM_FIXTURE}/profiles.json`)
+  assert.equal(resolved.auditFile, `${CUSTOM_FIXTURE}/audit.jsonl`)
+  assert.equal(resolved.knownHostsFile, `${CUSTOM_FIXTURE}/kh`)
 })
 
 test('a relative path is resolved against DSH_HOME', () => {
-  const resolved = resolveConfig(Config({ profilesFile: 'ssh/profiles.json' }), { DSH_HOME: 'C:/dsh-home' })
-  assert.equal(resolved.profilesFile, 'C:\\dsh-home\\ssh\\profiles.json')
+  const resolved = resolveConfig(Config({ profilesFile: 'ssh/profiles.json' }), { DSH_HOME: HOME_FIXTURE })
+  assert.equal(resolved.profilesFile, join(HOME_NATIVE, 'ssh', 'profiles.json'))
 })
 
 test('resolveDshHome falls back to ~/.dsh and ignores a blank override', () => {
