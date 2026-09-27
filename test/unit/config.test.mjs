@@ -19,6 +19,7 @@ test('an empty config object resolves every declared key', () => {
     'maxSessions',
     'maxConcurrentOpsPerSession',
     'maxOutputBytes',
+    'maxReplayFrames',
     'connectTimeoutMs',
     'operationTimeoutMs',
     'graceKillMs',
@@ -29,6 +30,7 @@ test('an empty config object resolves every declared key', () => {
     'sftp',
     'secrets',
     'logging',
+    'activity',
     'confirmDangerous',
     'allowAgentTools',
     'tools',
@@ -186,4 +188,15 @@ test('the public projection drops the internal redaction list and keeps the rest
   assert.equal(publicConfig.knownHostsFile, resolved.knownHostsFile)
   assert.equal(publicConfig.maxSessions, resolved.maxSessions)
   assert.equal(JSON.stringify(publicConfig).includes('redactKeys'), false)
+})
+
+test('the replay frame bound accepts 0 as "no cap" and clamps everything else', () => {
+  // 8192 is inert for frames >= 32 bytes (262144 / 8192 = 32), so the byte
+  // budget still decides for every realistic chunk size; only tiny-frame streams
+  // see the count bound. See src/config.ts's comment for the measurement behind it.
+  assert.equal(resolveConfig(Config({})).maxReplayFrames, 8192)
+  // 0 is a meaningful value, not "unset": it restores an unbounded count.
+  assert.equal(resolveConfig(Config({ maxReplayFrames: 0 })).maxReplayFrames, 0)
+  assert.equal(resolveConfig(Config({ maxReplayFrames: -1 })).maxReplayFrames, 0)
+  assert.equal(resolveConfig(Config({ maxReplayFrames: 99_999_999 })).maxReplayFrames, 1_000_000)
 })

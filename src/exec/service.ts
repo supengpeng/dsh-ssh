@@ -74,6 +74,12 @@ export interface ExecServiceOptions {
   settleMs?: number
   /** Replay window kept per stream for `sinceSeq` resubscription. */
   replayLimitBytes?: number
+  /**
+   * Count bound on the replay window (the config's `maxReplayFrames`). Left
+   * `undefined` the hub passes nothing and `FrameWriter`'s own default applies,
+   * so this option cannot accidentally *disable* the bound by defaulting to 0.
+   */
+  replayLimitFrames?: number
   /** How many finished streams stay addressable for late subscribers. */
   maxFinishedStreams?: number
 }
@@ -92,6 +98,16 @@ export interface ExecWaitOptions {
   cols?: number
   rows?: number
   term?: string
+  /**
+   * Every frame of this command, as it happens.
+   *
+   * This exists for the agent-activity mirror (ICD §4.7): `ssh_exec` has to see
+   * the output while the command is still running, because the tool only returns
+   * when it finishes. It is strictly observational — a throwing observer is
+   * swallowed and unsubscribed, so a mirror can never fail the command it mirrors,
+   * and the callback must not be used for control flow.
+   */
+  onFrame?: (frame: Frame) => void
 }
 
 export class ExecService {
@@ -108,6 +124,7 @@ export class ExecService {
     this.hub = new StreamHub({
       now: this.now,
       replayLimitBytes: options.replayLimitBytes ?? options.limits.maxOutputBytes,
+      ...(options.replayLimitFrames === undefined ? {} : { replayLimitFrames: options.replayLimitFrames }),
       maxFinishedStreams: options.maxFinishedStreams,
       onViolation: (violation) => this.log?.warn?.(`dsh-ssh: frame invariant: ${violation}`),
     })
@@ -268,6 +285,25 @@ export class ExecService {
       now: this.now,
       logger: this.log,
     })
+
+    // The activity mirror (ICD §4.7) observes a command that is still running, so
+    // its subscription lives exactly as long as the command does: released when
+    // `done` settles, never left attached to a finished stream. A throwing observer
+    // is contained here — the mirror reports on the command, and a report must not
+    // be able to fail what it reports on.
+    const onFrame = options.onFrame
+    if (onFrame !== undefined) {
+      const subscription = this.hub.subscribe(started.streamId, (frame) => {
+        try {
+          onFrame(frame)
+        } catch (error) {
+          this.log?.warn?.(`dsh-ssh: exec frame observer threw: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      })
+      const release = (): void => subscription.unsubscribe()
+      void started.done.then(release, release)
+    }
+
     return started
   }
 

@@ -50,6 +50,8 @@ export interface OpenStreamOptions {
   controls?: StreamControl
   /** Overrides the hub default; the exec layer passes the config value. */
   replayLimitBytes?: number
+  /** Count bound on the replay window; `undefined` keeps `FrameWriter`'s default. */
+  replayLimitFrames?: number
   /** Caller-supplied id (tests, reconnect); generated when omitted. */
   streamId?: string
 }
@@ -82,6 +84,8 @@ export interface SubscribeOptions {
 export interface StreamHubOptions {
   now?: () => number
   replayLimitBytes?: number
+  /** Count bound on the replay window; `undefined` keeps `FrameWriter`'s default. */
+  replayLimitFrames?: number
   /** How many finished streams stay addressable for late subscribers. */
   maxFinishedStreams?: number
   onViolation?: (violation: string) => void
@@ -104,6 +108,12 @@ const DEFAULT_FINISHED_STREAMS = 64
 export class StreamHub {
   private readonly now: () => number
   private readonly replayLimitBytes: number
+  /**
+   * `undefined` is preserved, never collapsed to 0: `FrameWriter` reads 0 as
+   * "no count bound", so defaulting here would silently *disable* the bound this
+   * option exists to enforce. Unset must stay unset and let FrameWriter decide.
+   */
+  private readonly replayLimitFrames: number | undefined
   private readonly maxFinishedStreams: number
   private readonly onViolation: (violation: string) => void
   private readonly records = new Map<string, StreamRecord>()
@@ -112,6 +122,8 @@ export class StreamHub {
   constructor(options: StreamHubOptions = {}) {
     this.now = options.now ?? Date.now
     this.replayLimitBytes = Math.max(4096, Math.trunc(options.replayLimitBytes ?? 262_144))
+    this.replayLimitFrames =
+      options.replayLimitFrames === undefined ? undefined : Math.max(0, Math.trunc(options.replayLimitFrames))
     this.maxFinishedStreams = Math.max(1, Math.trunc(options.maxFinishedStreams ?? DEFAULT_FINISHED_STREAMS))
     this.onViolation = options.onViolation ?? (() => {})
   }
@@ -146,11 +158,13 @@ export class StreamHub {
       // Assigned immediately below; the sink closes over `record`, not `writer`.
       writer: undefined as unknown as FrameWriter,
     }
+    const replayLimitFrames = options.replayLimitFrames ?? this.replayLimitFrames
     const writer = new FrameWriter({
       streamId,
       kind: options.kind,
       meta: options.meta,
       replayLimitBytes: options.replayLimitBytes ?? this.replayLimitBytes,
+      ...(replayLimitFrames === undefined ? {} : { replayLimitFrames }),
       now: this.now,
       sink: (frame) => this.dispatch(record, frame),
       onViolation: this.onViolation,

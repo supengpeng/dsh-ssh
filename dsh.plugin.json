@@ -3,7 +3,7 @@
   "id": "dsh-ssh",
   "packageName": "@local/dsh-ssh",
   "exportName": "dsh-ssh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "kind": "host+client",
   "entry": "./lib/index.js",
   "source": "./src/index.ts",
@@ -51,6 +51,7 @@
   "defaults": {
     "maxSessions": 10,
     "maxConcurrentOpsPerSession": 4,
+    "maxReplayFrames": 8192,
     "connectTimeoutMs": 15000,
     "operationTimeoutMs": 120000,
     "keepaliveIntervalMs": 20000,

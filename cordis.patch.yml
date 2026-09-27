@@ -27,6 +27,11 @@
         maxConcurrentOpsPerSession: 4
         # Bytes kept per command stream (head+tail truncation), per channel.
         maxOutputBytes: 262144
+        # `data` frames kept in one stream's replay log, independent of the byte
+        # budget above; 0 = no count cap. Inert for frames >= 32 bytes (the byte
+        # budget binds first) — it exists for tiny-frame streams, where the byte
+        # budget alone would retain ~131k entries plus their per-entry overhead.
+        maxReplayFrames: 8192
         # ── Time ─────────────────────────────────────────────────────────────
         connectTimeoutMs: 15000
         operationTimeoutMs: 120000
@@ -79,6 +84,19 @@
             - token
             - key
             - authorization
+        # ── Agent activity ───────────────────────────────────────────────────
+        # The mirror of what the model did through the ssh_* tools, shown in the
+        # 终端 tab next to the interactive shell (ICD §4.7). Bounded on purpose:
+        # this is a view, not a log — the audit file stays the durable record.
+        activity:
+          # Record agent-driven operations at all.
+          enabled: true
+          # Retained records; a finished record is evicted before a running one.
+          maxRecords: 200
+          # Text kept per record before the tail is dropped (truncated is set).
+          maxRecordBytes: 65536
+          # Text kept for the whole feed before the oldest records are evicted.
+          maxTotalBytes: 1048576
         # ── Governance ───────────────────────────────────────────────────────
         # Destructive operations (delete/overwrite/close-live-session) ask first.
         confirmDangerous: true

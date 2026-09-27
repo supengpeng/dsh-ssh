@@ -25,6 +25,7 @@ auditFile: ''             # '' → <DSH_HOME>/logs/dsh-ssh/audit.jsonl（插件�
 maxSessions: 10           # 同时在线会话上限（验收项「10 会话并发」）
 maxConcurrentOpsPerSession: 4   # 单会话并发操作上限（超出 → SSH_LIMIT_QUEUE_FULL）
 maxOutputBytes: 262144    # 单条命令保留的 stdout/stderr 字节数，超出保留头尾各 50%
+maxReplayFrames: 8192     # 单流回放日志保留的 data 帧数上限（0 = 不限）；帧 >= 32B 时字节上限先生效，此项不改变行为
 
 # ── 时间 ────────────────────────────────────────────────────────────────────
 connectTimeoutMs: 15000   # 建连超时 → SSH_TIMEOUT_CONNECT
@@ -78,15 +79,26 @@ logging:
     - key
     - authorization
 
+# ── Agent 活动镜像（ICD §4.7）───────────────────────────────────────────────
+# 有界视图，不是日志：记录模型经 ssh_* 工具做过的事，供「终端」标签的 AI 活动面展示。
+# 要事后追查请读审计文件（auditFile，脱敏后 JSONL 落盘）。
+activity:
+  enabled: true           # false = 整体不记录（零事件、空快照），工具行为不变
+  maxRecords: 200         # 保留的记录条数；环满先丢最老的已结束记录
+  maxRecordBytes: 65536   # 单条记录的文本上限（超出丢尾部并置 truncated）
+  maxTotalBytes: 1048576  # 整个 feed 的文本上限
+
 # ── 治理 ────────────────────────────────────────────────────────────────────
 confirmDangerous: true    # 删除/覆盖等危险操作在 UI 二次确认
 allowAgentTools: true     # 是否把 ssh_* 工具注册给模型
-tools:                    # 注册哪些 Agent 工具（名字必须与 ICD §0 一致）
+tools:                    # 注册哪些 Agent 工具（名字与顺序都与 ICD §0 / schema 默认一致）
+  - ssh_connect
+  - ssh_disconnect
+  - ssh_sessions
   - ssh_exec
   - ssh_upload
   - ssh_download
   - ssh_list_dir
-  - ssh_sessions
 
 # ── UI ──────────────────────────────────────────────────────────────────────
 ui:

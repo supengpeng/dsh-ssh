@@ -38,6 +38,24 @@ export const Config: z<Config> = z.object({
   maxConcurrentOpsPerSession: z.number().default(4),
   /** Bytes of stdout/stderr kept per command before head+tail truncation. */
   maxOutputBytes: z.number().default(262144),
+  /**
+   * `data` frames kept in one stream's replay log, independent of the byte
+   * budget above. `0` disables the count bound.
+   *
+   * The byte budget alone is a trap for streams that write in tiny frames: with
+   * 2-byte frames it retains ~131k entries to fill 256 KiB, and every entry also
+   * carries its own wrapper object and frame object. Measured on the pre-fix
+   * code: 262,176 B of payload occupied 17.8 MB of heap (62.5×) and the trim
+   * loop cost 3.5 ms per frame because it rescanned the whole log four times.
+   *
+   * 8192 is chosen so the bound is *inert* for frames of 32 bytes and larger
+   * (262144 / 8192 = 32): at that point the byte budget always evicts first, so
+   * behaviour is unchanged for every realistic chunk size. Only sub-32-byte
+   * frames — interactive echo, progress dots — see a smaller replay window, and
+   * that loss is already reported through `replayDropped` and `gap` rather than
+   * hidden.
+   */
+  maxReplayFrames: z.number().default(8192),
 
   // ── Time ─────────────────────────────────────────────────────────────────
   connectTimeoutMs: z.number().default(15000),
@@ -98,6 +116,32 @@ export const Config: z<Config> = z.object({
     })
     .default({}),
 
+  // ── Agent activity ───────────────────────────────────────────────────────
+  /**
+   * The mirror of what the model does through the `ssh_*` tools (ICD §4.7).
+   *
+   * Every one of those calls is invisible in the session workspace — the client
+   * only ever sees the operations *it* started — so a user watching the 终端 tab
+   * while the agent works sees nothing. The feed records the calls (and, for a
+   * command, its live output) in a bounded in-memory ring that the panel reads.
+   *
+   * Bounded on purpose: this is a view, not a log. The durable record of what
+   * happened is the audit file (metadata, redacted); the feed keeps enough text
+   * to read the last few commands and drops the rest.
+   */
+  activity: z
+    .object({
+      /** Record agent-driven operations for the panel's activity view. */
+      enabled: z.boolean().default(true),
+      /** Retained records; a finished record is evicted before a running one. */
+      maxRecords: z.number().default(200),
+      /** Text kept per record before the tail is dropped (`truncated` is set). */
+      maxRecordBytes: z.number().default(65536),
+      /** Text kept for the whole feed before the oldest records are evicted. */
+      maxTotalBytes: z.number().default(1048576),
+    })
+    .default({}),
+
   // ── Governance ───────────────────────────────────────────────────────────
   /** Destructive operations (delete/overwrite) ask for confirmation in the UI. */
   confirmDangerous: z.boolean().default(true),
@@ -142,6 +186,7 @@ export interface Config {
   maxSessions: number
   maxConcurrentOpsPerSession: number
   maxOutputBytes: number
+  maxReplayFrames: number
   connectTimeoutMs: number
   operationTimeoutMs: number
   graceKillMs: number
@@ -152,6 +197,7 @@ export interface Config {
   sftp: SftpConfig
   secrets: SecretsConfig
   logging: LoggingConfig
+  activity: ActivityConfig
   confirmDangerous: boolean
   allowAgentTools: boolean
   tools: string[]
@@ -188,6 +234,14 @@ export interface LoggingConfig {
   level: 'debug' | 'info' | 'warn' | 'error'
   redact: boolean
   redactKeys: string[]
+}
+
+/** The agent-activity mirror's limits (ICD §4.7, §6). */
+export interface ActivityConfig {
+  enabled: boolean
+  maxRecords: number
+  maxRecordBytes: number
+  maxTotalBytes: number
 }
 
 export interface UiConfig {
@@ -267,6 +321,9 @@ export function resolveConfig(config: Config, env: NodeJS.ProcessEnv = process.e
     maxSessions: clampInt(config.maxSessions, 1, 1000),
     maxConcurrentOpsPerSession: clampInt(config.maxConcurrentOpsPerSession, 1, 64),
     maxOutputBytes: clampInt(config.maxOutputBytes, 1024, 64 * 1024 * 1024),
+    // 0 is a meaningful value here (no count bound), so the low end is 0 rather
+    // than 1; a negative or non-finite value still clamps to the safe minimum.
+    maxReplayFrames: clampInt(config.maxReplayFrames, 0, 1_000_000),
     connectTimeoutMs: clampInt(config.connectTimeoutMs, 1000, 600000),
     operationTimeoutMs: clampInt(config.operationTimeoutMs, 1000, 3600000),
     graceKillMs: clampInt(config.graceKillMs, 0, 60000),

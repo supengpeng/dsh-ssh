@@ -45,6 +45,8 @@ export interface OpenStreamOptions {
     controls?: StreamControl;
     /** Overrides the hub default; the exec layer passes the config value. */
     replayLimitBytes?: number;
+    /** Count bound on the replay window; `undefined` keeps `FrameWriter`'s default. */
+    replayLimitFrames?: number;
     /** Caller-supplied id (tests, reconnect); generated when omitted. */
     streamId?: string;
 }
@@ -73,6 +75,8 @@ export interface SubscribeOptions {
 export interface StreamHubOptions {
     now?: () => number;
     replayLimitBytes?: number;
+    /** Count bound on the replay window; `undefined` keeps `FrameWriter`'s default. */
+    replayLimitFrames?: number;
     /** How many finished streams stay addressable for late subscribers. */
     maxFinishedStreams?: number;
     onViolation?: (violation: string) => void;
@@ -80,6 +84,12 @@ export interface StreamHubOptions {
 export declare class StreamHub {
     private readonly now;
     private readonly replayLimitBytes;
+    /**
+     * `undefined` is preserved, never collapsed to 0: `FrameWriter` reads 0 as
+     * "no count bound", so defaulting here would silently *disable* the bound this
+     * option exists to enforce. Unset must stay unset and let FrameWriter decide.
+     */
+    private readonly replayLimitFrames;
     private readonly maxFinishedStreams;
     private readonly onViolation;
     private readonly records;
