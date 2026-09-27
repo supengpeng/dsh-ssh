@@ -12,7 +12,11 @@
 #      first, then the build, then the client suite against the real artifact.
 #
 # Env-gated suites (real SSH target, OpenSSH interop) skip themselves when their
-# variables are absent, so CI is green without a target host rather than fake-green.
+# variables are absent — but "skips itself" and "CI is green" are not the same
+# claim: `node --test` exits 0 when a whole file skips. The OpenSSH interop file,
+# which is the only out-of-tree truth source for known_hosts, therefore has its
+# own step below that asserts the counts instead of trusting the exit code. The
+# real-target suite stays opt-in and is not run here at all.
 
 name: CI
 
@@ -40,21 +44,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `npm ci` used to guard the install behind a `|| npm install` fallback, but
+      # this repository has no package-lock.json (only pnpm-lock.yaml), so `npm ci`
+      # failed every run and the fallback silently performed an unlocked install.
+      # The lockfile that actually exists is now the one CI installs from, and the
+      # fallback is gone so a broken install fails loudly instead of quietly
+      # resolving whatever the registry serves that day.
+      #
+      # pnpm 10 (not 11): package.json declares `engines.node >= 20` and the matrix
+      # below still runs Node 20, while pnpm 11+ requires Node >= 22.13. 10.34.5
+      # reads this lockfile (lockfileVersion 9.0) and covers both legs.
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.34.5
+
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+          cache: pnpm
 
-      - name: Install dependencies
-        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+      # `--frozen-lockfile`: the lockfile is the contract. It is verified in sync
+      # with package.json locally (`pnpm install --frozen-lockfile --lockfile-only`).
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
 
       - name: Typecheck (tsc --noEmit)
-        run: npm run typecheck
+        run: pnpm run typecheck
 
       - name: Unit tests (host half)
-        run: npm run test:unit
+        run: pnpm run test:unit
 
       - name: Build host half + client bundle
-        run: npm run build
+        run: pnpm run build
 
       - name: Generated artifacts are in sync
         run: |
@@ -63,10 +84,41 @@ jobs:
           test -f client/src/chrome/locale.gen.js
 
       - name: Client tests (against the built bundle)
-        run: npm run test:client
+        run: pnpm run test:client
 
       - name: Integration tests (env-gated suites skip)
-        run: npm run test:integration
+        run: pnpm run test:integration
+
+      # `node --test` exits 0 when every case in a file skips, so this file — the
+      # only out-of-tree truth source for known_hosts (it cross-checks our
+      # fingerprints against the real ssh-keygen) — could stay green while
+      # executing nothing. The probe in the file now finds ssh-keygen on POSIX
+      # too; this step asserts the counts so a silent regression to "all skipped"
+      # is a red build. It reuses the same parser verify-all reports with, and
+      # writes its report outside the repository so the dirty-tree gate below
+      # stays meaningful.
+      - name: OpenSSH interop must execute, not skip
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/openssh-interop.txt"
+          node --test --test-concurrency=1 --test-force-exit test/integration/openssh-interop.test.mjs > "$report" 2>&1 || { cat "$report"; exit 1; }
+          cat "$report"
+          REPORT="$report" node --input-type=module -e '
+            import { readFileSync } from "node:fs"
+            import { resolve } from "node:path"
+            import { pathToFileURL } from "node:url"
+            const { parseTestCounts } = await import(pathToFileURL(resolve("scripts/verify-all.mjs")).href)
+            const counts = parseTestCounts(readFileSync(process.env.REPORT, "utf8").split(/\r?\n/))
+            console.log("openssh-interop counts:", JSON.stringify(counts))
+            if (!counts) {
+              console.error("::error::openssh-interop produced no test counts — the reporter output could not be parsed")
+              process.exit(1)
+            }
+            if (counts.skipped > 0 || counts.passed === 0) {
+              console.error(`::error::openssh-interop executed nothing useful (passed=${counts.passed}, skipped=${counts.skipped}) — the only out-of-tree known_hosts truth source is dead`)
+              process.exit(1)
+            }
+          '
 
       - name: Contract gate — ICD §4 method table
         run: DSH_SSH_STRICT_ICD=1 node --test --test-concurrency=1 test/integration/icd-conformance.test.mjs

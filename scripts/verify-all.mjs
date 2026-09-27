@@ -23,6 +23,18 @@
  * `TIMEOUT` for that layer and the whole run exits non-zero. Without that, a
  * single leaked handle turns CI into "never finishes" instead of "failed".
  *
+ * A layer that executes **nothing** is not a pass either. `node --test` exits 0
+ * when every case in a file skips, so an env-gated layer (the real-host suite,
+ * or the OpenSSH interop file on a runner without `ssh-keygen`) used to report
+ * `PASS` while running zero assertions. The `tests/pass/skipped` counts are now
+ * parsed out of the layer's own output, and a layer with no passing case becomes
+ * `SKIP`: it gets its own heading in the summary and it makes the run exit
+ * non-zero, because "verify:all is green" must mean "things actually ran".
+ *
+ * The run header also prints which layers `npm test` would *not* have run: that
+ * script chains only unit + client, so "I ran the tests" means two different
+ * things depending on which entry point was used.
+ *
  * Options:
  *   --only <id[,id]>   run just these layers (repeatable)
  *   --skip-perf        omit the perf layer (fast iteration)
@@ -41,9 +53,9 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
-import { readdirSync, writeFileSync } from 'node:fs'
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -258,12 +270,17 @@ function runLayer(layer) {
 
     const finish = (status, extra = {}) => {
       clearTimeout(timer)
+      const counts = layer.kind === 'test' ? parseTestCounts(tail) : undefined
+      const judged = classifyLayerStatus(status, counts)
+      const note = [extra.note, judged.note].filter(Boolean).join(' · ') || undefined
       resolve({
         ...layer,
-        status,
+        status: judged.status,
         durationMs: Date.now() - started,
         tail: tail.slice(-OUTPUT_TAIL_LINES),
         ...extra,
+        ...(counts ? { counts } : {}),
+        ...(note ? { note } : {}),
       })
     }
 
@@ -337,6 +354,71 @@ function killTree(pid) {
 const STATUS_ICON = { pass: 'PASS', fail: 'FAIL', timeout: 'TIMEOUT', skipped: 'SKIP' }
 
 /**
+ * Read the `node --test` spec-reporter counts out of a layer's captured output.
+ *
+ * Exported so `test/unit/verify-all-reporting.test.mjs` can assert the rule
+ * without starting a suite, and so the CI guard can reuse the same parser
+ * instead of grepping for a reporter string that may be reworded.
+ *
+ * Returns `undefined` when the summary is absent (a non-test layer, a spawn that
+ * failed, or an unrecognised reporter format), which makes the caller fall back
+ * to the exit code rather than invent a verdict.
+ */
+export function parseTestCounts(lines) {
+  const text = Array.isArray(lines) ? lines.join('\n') : String(lines ?? '')
+  const read = (label) => {
+    const match = new RegExp(`^\\u2139\\s+${label}\\s+(\\d+)\\s*$`, 'm').exec(text)
+    return match ? Number(match[1]) : undefined
+  }
+  const tests = read('tests')
+  if (tests === undefined) return undefined
+  return { tests, passed: read('pass') ?? 0, skipped: read('skipped') ?? 0 }
+}
+
+/**
+ * The SKIP-versus-PASS rule.
+ *
+ * `node --test` exits 0 when every case skips, so an exit code alone cannot tell
+ * "the layer passed" from "the layer executed nothing". Zero passing cases with
+ * at least one skip is the zero-execution signature: report it as `SKIP` and put
+ * it in the note, so it can never be read as a green layer.
+ *
+ * A `fail`/`timeout` is never upgraded — a layer that broke is a failure even if
+ * it also skipped something.
+ */
+export function classifyLayerStatus(status, counts) {
+  if (status !== 'pass') return { status, note: undefined }
+  if (!counts || counts.tests <= 0) return { status, note: undefined }
+  if (counts.passed === 0 && counts.skipped > 0) {
+    return {
+      status: 'skipped',
+      note: `executed nothing: ${counts.skipped}/${counts.tests} cases skipped`,
+    }
+  }
+  return { status, note: undefined }
+}
+
+/**
+ * Which of the selected layers `npm test` would **not** run.
+ *
+ * `package.json`'s `test` script chains a subset of these layers, so the phrase
+ * "the tests pass" is ambiguous unless the gap is printed. `realOnly` and
+ * `coverageOnly` layers are excluded because they are opt-in by construction.
+ */
+export function npmTestCoverageGap(testScript, selected = layers) {
+  const chained = new Set(
+    [...String(testScript ?? '').matchAll(/(?:npm|pnpm|yarn)\s+run\s+([\w:-]+)/g)].map((match) => match[1]),
+  )
+  const covered = []
+  const missing = []
+  for (const layer of selected) {
+    if (layer.kind !== 'test' || layer.realOnly || layer.coverageOnly) continue
+    ;(chained.has(layer.id) ? covered : missing).push(layer.id)
+  }
+  return { covered, missing }
+}
+
+/**
  * Environment hygiene (ICD §12 R9).
  *
  * The suite is fast (449 unit tests in ~34s) *when it is the only one running*.
@@ -399,6 +481,11 @@ async function main() {
   console.log(`  layers: ${selected.map((layer) => layer.id).join(' → ')}`)
   if (timeoutFactor !== 1) console.log(`  timeout factor: ${timeoutFactor}`)
   console.log(`  env scrubbed: ${ENV_SCRUB.join(', ')}`)
+  // `npm test` is not the full suite: it chains unit + client only. Printing the
+  // gap keeps "I ran the tests" from meaning two different things.
+  const gap = npmTestCoverageGap(readNpmTestScript(), selected)
+  console.log(`  npm test runs: ${gap.covered.length ? gap.covered.join(', ') : '(none of the layers below)'}`)
+  if (gap.missing.length) console.log(`  this run adds: ${gap.missing.join(', ')}   ← npm test does not run these`)
   console.log('='.repeat(78))
 
   const results = []
@@ -410,15 +497,28 @@ async function main() {
     console.log(`----- [${layer.id}] ${STATUS_ICON[result.status]} in ${(result.durationMs / 1000).toFixed(1)}s${result.note ? ` · ${result.note}` : ''}`)
   }
 
-  const failed = results.filter((result) => result.status !== 'pass')
+  // Three verdicts, not two. `skipped` means "the layer ran zero passing cases";
+  // it is kept apart from `fail`/`timeout` so a dead env-gated layer is never
+  // mistaken for a broken one — but it still makes the run exit non-zero.
+  const failed = results.filter((result) => result.status === 'fail' || result.status === 'timeout')
+  const zeroExecution = results.filter((result) => result.status === 'skipped')
   console.log(`\n${'='.repeat(78)}`)
   console.log('summary')
   for (const result of results) {
     const seconds = (result.durationMs / 1000).toFixed(1).padStart(7)
-    console.log(`  ${STATUS_ICON[result.status].padEnd(7)} ${result.id.padEnd(18)} ${seconds}s${result.note ? `  ${result.note}` : ''}`)
+    const counts = result.counts ? `  ${result.counts.passed}/${result.counts.tests}${result.counts.skipped ? ` (${result.counts.skipped} skipped)` : ''}` : ''
+    console.log(`  ${STATUS_ICON[result.status].padEnd(7)} ${result.id.padEnd(18)} ${seconds}s${counts}${result.note ? `  ${result.note}` : ''}`)
   }
   const total = ((Date.now() - startedAt) / 1000).toFixed(1)
-  console.log(`  total ${total}s · ${results.length - failed.length}/${results.length} layers green`)
+  console.log(`  total ${total}s · ${results.length - failed.length - zeroExecution.length}/${results.length} layers green`)
+
+  if (zeroExecution.length) {
+    console.log('\nzero-execution layers (a green exit code here would have been a lie):')
+    for (const result of zeroExecution) {
+      const counts = result.counts ? `${result.counts.skipped}/${result.counts.tests} cases skipped` : 'no test counts could be parsed'
+      console.log(`  ${result.id.padEnd(18)} ${counts}${result.note ? ` — ${result.note}` : ''}`)
+    }
+  }
 
   if (failed.length) {
     console.log('\nfailed layers:')
@@ -426,18 +526,55 @@ async function main() {
       console.log(`\n### ${result.id} (${result.status})${result.note ? ` — ${result.note}` : ''}`)
       for (const line of result.tail) console.log(`    ${line}`)
     }
-    console.log('\nverify-all: FAILED')
+  }
+
+  if (failed.length || zeroExecution.length) {
+    const parts = []
+    if (failed.length) parts.push(`${failed.length} failed`)
+    if (zeroExecution.length) parts.push(`${zeroExecution.length} executed nothing (${zeroExecution.map((result) => result.id).join(', ')})`)
+    console.log(`\nverify-all: FAILED (${parts.join('; ')})`)
   } else {
     console.log('\nverify-all: OK')
   }
 
   if (emitJson) {
     const out = join(tmpdir(), 'dsh-ssh-verify.json')
-    writeFileSync(out, JSON.stringify({ at: new Date().toISOString(), totalSeconds: Number(total), results: results.map(({ tail, ...rest }) => ({ ...rest, tail: tail.slice(-10) })) }, null, 2), 'utf8')
+    writeFileSync(out, JSON.stringify({ at: new Date().toISOString(), totalSeconds: Number(total), zeroExecution: zeroExecution.map((result) => result.id), results: results.map(({ tail, ...rest }) => ({ ...rest, tail: tail.slice(-10) })) }, null, 2), 'utf8')
     console.log(`json: ${out}`)
   }
 
-  process.exit(failed.length ? 1 : 0)
+  process.exit(failed.length || zeroExecution.length ? 1 : 0)
 }
 
-void main()
+/** `npm test`'s chain, read from the manifest (empty when unreadable). */
+function readNpmTestScript() {
+  try {
+    return JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).scripts?.test ?? ''
+  } catch {
+    return ''
+  }
+}
+
+export { layers, selectLayers, detectConcurrentTestRuns }
+
+/**
+ * Only drive a run when this file is the entry point.
+ *
+ * `test/unit/verify-all-reporting.test.mjs` imports the pure helpers above to
+ * assert the SKIP-versus-PASS rule without starting a suite, and the CI guard
+ * imports `parseTestCounts` for the same reason; without this guard either
+ * import would launch the whole verification. The basename test is deliberate:
+ * `node -e` sets `argv[1]` to something that is not this file, and resolving a
+ * non-path entry must never be read as "run everything".
+ */
+const invokedDirectly = (() => {
+  const entry = process.argv[1]
+  if (!entry || !/verify-all\.mjs$/i.test(entry)) return false
+  try {
+    return resolve(entry) === resolve(fileURLToPath(import.meta.url))
+  } catch {
+    return false
+  }
+})()
+
+if (invokedDirectly) void main()

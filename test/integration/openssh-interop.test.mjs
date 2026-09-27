@@ -17,22 +17,74 @@
  *   4. The policy matrix behaves per ICD §5/§6 on real key material: strict
  *      (unknown → SSH_HOSTKEY_UNKNOWN), accept-new + remember → `exact`,
  *      same-type different-key → SSH_HOSTKEY_MISMATCH/`changed`, a *different*
- *      key type → `unknown` (not a mismatch), insecure → accepted.
+ *      key type for an already-known host → also MISMATCH/`changed` (F-SEC-04),
+ *      `@revoked` → MISMATCH/`changed` for every key type (RT-A-3),
+ *      insecure → accepted, without consulting known_hosts at all (so `@revoked`
+ *      is out of scope there — asserted explicitly, not left implied).
  *
  * If `ssh-keygen` is missing the whole file skips with an explicit reason — it
  * never silently passes.
  */
 
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-const SSH_KEYGEN = process.env.DSH_SSH_SSH_KEYGEN ?? 'C:\\WINDOWS\\System32\\OpenSSH\\ssh-keygen.exe'
-const available = existsSync(SSH_KEYGEN)
-const SKIP_REASON = `ssh-keygen not found at ${SSH_KEYGEN} (set DSH_SSH_SSH_KEYGEN to point at it)`
+/**
+ * Locate the real `ssh-keygen` across platforms.
+ *
+ * The default used to be a hardcoded Windows path. On a Linux runner
+ * `existsSync('C:\\WINDOWS\\...')` is always false, so every case in this file
+ * skipped — and `node --test` exits 0 when a file's cases all skip, so CI stayed
+ * green while the *only* out-of-tree truth source for `known_hosts` executed
+ * nothing. `DSH_SSH_SSH_KEYGEN` still wins; the rest are probed in order.
+ */
+const KEYGEN_PROBE_FILE = '__dsh-ssh-keygen-probe-does-not-exist__'
+const KEYGEN_CANDIDATES = [
+  process.env.DSH_SSH_SSH_KEYGEN,
+  'C:\\WINDOWS\\System32\\OpenSSH\\ssh-keygen.exe',
+  'C:\\Program Files\\OpenSSH\\ssh-keygen.exe',
+  '/usr/bin/ssh-keygen',
+  '/usr/local/bin/ssh-keygen',
+  '/bin/ssh-keygen',
+  '/opt/homebrew/bin/ssh-keygen',
+  'ssh-keygen',
+].filter((candidate) => typeof candidate === 'string' && candidate !== '')
+
+/**
+ * True when `candidate` is a runnable ssh-keygen.
+ *
+ * A bare command name is resolved through PATH by the OS, so it is accepted only
+ * after it actually runs. The probe asks for a guaranteed-missing key file:
+ * ssh-keygen then exits non-zero and complains, which is exactly the proof that
+ * the binary executed. `ENOENT` is the one failure that means "no such
+ * executable"; a non-zero exit status must not be mistaken for its absence.
+ */
+function keygenRuns(candidate) {
+  if ((candidate.includes('/') || candidate.includes('\\')) && !existsSync(candidate)) return false
+  try {
+    execFileSync(candidate, ['-l', '-f', KEYGEN_PROBE_FILE], { stdio: 'ignore', timeout: 10_000, windowsHide: true })
+    return true
+  } catch (error) {
+    return Boolean(error) && error.code !== 'ENOENT'
+  }
+}
+
+const keygen = (() => {
+  for (const candidate of KEYGEN_CANDIDATES) {
+    if (keygenRuns(candidate)) return { path: candidate, available: true }
+  }
+  return { path: KEYGEN_CANDIDATES[0] ?? 'ssh-keygen', available: false }
+})()
+
+const SSH_KEYGEN = keygen.path
+const available = keygen.available
+const SKIP_REASON =
+  `no runnable ssh-keygen: tried ${KEYGEN_CANDIDATES.map((candidate) => `\`${candidate}\``).join(', ')} ` +
+  '(set DSH_SSH_SSH_KEYGEN to point at one)'
 /** `DSH_SSH_STRICT_ICD=1` turns documented gaps into hard failures (M5 gate). */
 const STRICT = process.env.DSH_SSH_STRICT_ICD === '1'
 
@@ -183,20 +235,56 @@ test('openssh-interop: wildcards, negation markers and comments parse like OpenS
   // OpenSSH keeps the marker verbatim, `@` included.
   assert.ok(entries.some((entry) => entry.markers?.includes('@cert-authority')), '@cert-authority marker must be preserved')
   assert.ok(entries.some((entry) => entry.markers?.includes('@revoked')), '@revoked marker must be preserved')
-  // A revoked entry is never a valid acceptance, whatever the key says.
-  const revoked = await knownHosts
-    .createKnownHostsVerifier({ file, policy: 'accept-new' })
-    .verify({ host: 'revoked.example.com', port: 22, keyType: pair.keyType, key: pair.blob, policy: 'accept-new' })
-  if (revoked.ok === true) {
-    // Reported gap (owner: SP4 / src/known-hosts.ts): `parseKnownHosts` preserves
-    // the `@revoked` marker, but `verify()` does not act on it yet — OpenSSH
-    // rejects a revoked key regardless of the policy.
-    const reason = `KNOWN GAP: a @revoked entry was accepted (${JSON.stringify(revoked)}); OpenSSH would refuse it`
-    if (STRICT) assert.fail(reason)
-    t.diagnostic(reason)
-  } else {
-    assert.equal(revoked.code, 'SSH_HOSTKEY_MISMATCH', 'a revoked entry must be refused as a mismatch')
-  }
+  // A revoked entry is never a valid acceptance, whatever the key says (RT-A-3):
+  // `@revoked` refuses the *whole host*, across every key type, and it does so
+  // before the policy is consulted — a revocation is a refusal, not a question.
+  const revokedVerifier = knownHosts.createKnownHostsVerifier({ file, policy: 'accept-new' })
+  const revoked = await revokedVerifier.verify({
+    host: 'revoked.example.com',
+    port: 22,
+    keyType: pair.keyType,
+    key: pair.blob,
+    policy: 'accept-new',
+  })
+  assert.equal(revoked.ok, false, 'a @revoked host must never be accepted')
+  assert.equal(revoked.code, 'SSH_HOSTKEY_MISMATCH', 'a revoked entry must be refused as a mismatch')
+  assert.equal(revoked.knownHostsMatch, 'changed')
+  assert.equal(revoked.revoked, true, 'the refusal must say it is a revocation, not a same-type mismatch')
+
+  // Cross-algorithm: the same revoked host under a *different* key type is still
+  // refused. This is what makes the marker host-wide rather than type-scoped.
+  const revokedOtherType = await revokedVerifier.verify({
+    host: 'revoked.example.com',
+    port: 22,
+    keyType: 'ssh-rsa',
+    key: knownHosts.blobOf('ssh-rsa', Buffer.from('a different algorithm entirely')),
+    policy: 'accept-new',
+  })
+  assert.equal(revokedOtherType.ok, false, 'a revocation covers every key type for the host')
+  assert.equal(revokedOtherType.code, 'SSH_HOSTKEY_MISMATCH')
+
+  // The one place a revocation does NOT apply, asserted positively on purpose.
+  //
+  // `insecure` is defined as "never verify" (`cordis.patch.yml:51`) and it never
+  // consults known_hosts at all — the verifier returns "accepted" before it reads
+  // the file (`src/known-hosts.ts:341-346`), and the connection layer short-circuits
+  // even earlier (`src/connection/transport.ts:155-158`). So `@revoked` is not
+  // "broken under insecure", it is out of scope there, exactly like every other
+  // known_hosts rule. Ruling (task C): keep this boundary — `insecure` already
+  // accepts an arbitrary MITM key, so additionally rejecting a revoked one would
+  // not raise real security while breaking the documented break-glass escape hatch.
+  //
+  // Pinned as an assertion rather than left as an absent check: a future change
+  // that makes `insecure` honour `@revoked` must come here and change this line,
+  // instead of silently looking like a fix.
+  const revokedInsecure = await knownHosts
+    .createKnownHostsVerifier({ file, policy: 'insecure' })
+    .verify({ host: 'revoked.example.com', port: 22, keyType: pair.keyType, key: pair.blob, policy: 'insecure' })
+  assert.equal(
+    revokedInsecure.ok,
+    true,
+    'insecure never consults known_hosts (transport.ts:155-158), so @revoked does not apply to it — a deliberate boundary, not a gap',
+  )
 })
 
 test('openssh-interop: policy matrix on real key material (unknown / exact / changed / insecure)', async (t) => {
@@ -243,12 +331,13 @@ test('openssh-interop: policy matrix on real key material (unknown / exact / cha
   assert.equal(changed.code, 'SSH_HOSTKEY_MISMATCH')
   assert.equal(changed.knownHostsMatch, 'changed')
 
-  // A *different key type* is simply unknown — it must not be reported as a
-  // change (checked against a strict instance, since accept-new would adopt it).
+  // A *different key type* for a host we already know is a change, not a new
+  // host (F-SEC-04): once any entry names the host, a key presented under another
+  // algorithm must be refused as a mismatch rather than adopted as "unknown".
   const otherType = await strictVerifier.verify({ host, port, keyType: rsa.keyType, key: rsa.blob, policy: 'strict' })
   assert.equal(otherType.ok, false)
-  assert.equal(otherType.code, 'SSH_HOSTKEY_UNKNOWN', 'a new key type is unknown, not a mismatch')
-  assert.equal(otherType.knownHostsMatch, 'unknown')
+  assert.equal(otherType.code, 'SSH_HOSTKEY_MISMATCH', 'a new key type for a known host is a change (F-SEC-04)')
+  assert.equal(otherType.knownHostsMatch, 'changed')
 
   // insecure accepts anything presented.
   const lax = await knownHosts
