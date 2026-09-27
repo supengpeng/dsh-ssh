@@ -1,0 +1,8 @@
+# Isolates this package from any workspace above the session directory, so
+# `pnpm install` here manages exactly this package's dependencies (the SSH
+# runtime, the Typert Remote protocol, and the TypeScript build toolchain).
+packages:
+  - .
+allowBuilds:
+  cpu-features: set this to true or false
+  ssh2: set this to true or false

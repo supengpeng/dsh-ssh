@@ -1,0 +1,38 @@
+# 依赖与构建产物之外的本地文件
+node_modules/
+.pnpm-store/
+*.tsbuildinfo
+
+# 注意：lib/ 是**提交入库**的构建产物（DSH 直接消费 lib/index.js 与 lib/client.js），
+# 因此不在此忽略。CI 用 `node scripts/build-client.mjs --check` 校验产物与源码一致。
+
+# 测试与调试产物
+coverage/
+.nyc_output/
+*.log
+*-coverage.json
+dsh-ssh-verify.json
+.unused-audit.jsonl
+wire-probe.jsonl
+client-transport.json
+host-ready.json
+module-eval.json
+
+# 本地临时目录 / 真机测试用的凭据文件（绝不入库）
+tmp/
+.tmp/
+.env
+.env.*
+*.pem
+id_rsa*
+id_ed25519*
+known_hosts.local
+
+# 编辑器 / 操作系统
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

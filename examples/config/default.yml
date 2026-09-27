@@ -1,0 +1,96 @@
+# SSH 插件配置示例（`@local/dsh-ssh`）
+# ─────────────────────────────────────────────────────────────────────────────
+# 本文件是 `cordis.patch.yml` 中 dsh-ssh 行 `config:` 的**全量默认值**镜像。
+# 每一行的值 = `src/config.ts` 里 Schemastery schema 的 `.default(...)`。
+# 删掉某一行 = 回到默认值（由 `test/unit/config.test.mjs` 断言）。
+#
+# 用法：把需要的行复制进你的 profile `cordis.patch.yml`：
+#
+#   - id: dsh-ssh
+#     name: '@local/dsh-ssh'
+#     config:
+#       hostKey:
+#         policy: strict
+#
+# ⚠️ 安全铁律：**这里永远不写密码/passphrase/私钥内容**。
+#    profile 文件只存**引用名**（如 DSH_SSH_PROD_PASSWORD），值放在
+#    `~/.dsh/.credentials.yaml`（通过 ctx.credentials）或启动环境变量里。
+#    详见 examples/config/env-credentials.yml 与 src/security/README.md。
+
+# ── 存储路径（'' = 按 DSH_HOME 推导；相对路径按 DSH_HOME 解析）─────────────
+profilesFile: ''          # '' → <DSH_HOME>/dsh-ssh/profiles.json
+auditFile: ''             # '' → <DSH_HOME>/logs/dsh-ssh/audit.jsonl（插件日志 plugin.jsonl 同目录）
+
+# ── 并发限额 ────────────────────────────────────────────────────────────────
+maxSessions: 10           # 同时在线会话上限（验收项「10 会话并发」）
+maxConcurrentOpsPerSession: 4   # 单会话并发操作上限（超出 → SSH_LIMIT_QUEUE_FULL）
+maxOutputBytes: 262144    # 单条命令保留的 stdout/stderr 字节数，超出保留头尾各 50%
+
+# ── 时间 ────────────────────────────────────────────────────────────────────
+connectTimeoutMs: 15000   # 建连超时 → SSH_TIMEOUT_CONNECT
+operationTimeoutMs: 120000  # 单次操作超时 → SSH_TIMEOUT_OPERATION
+graceKillMs: 3000         # 超时后 SIGTERM → SIGKILL 的宽限期
+keepaliveIntervalMs: 20000  # keepalive 间隔（0 = 关闭）
+keepaliveCountMax: 3      # 连续未响应次数 → 判定链路死亡（SSH_TIMEOUT_IDLE）
+
+# ── 重试退避（仅对 retryable 错误码生效）────────────────────────────────────
+retries:
+  max: 2                  # 最大重试次数
+  backoffBaseMs: 500      # 退避基数：base * 2^n
+  backoffMaxMs: 5000      # 退避上限
+  jitter: true            # ±25% 抖动
+
+# ── 主机密钥（安全关键项）───────────────────────────────────────────────────
+hostKey:
+  # strict     = 未见过的主机直接拒绝（SSH_HOSTKEY_UNKNOWN），适合生产
+  # accept-new = 首次自动接受并写入 known_hosts（OpenSSH 的 accept-new 语义）
+  # insecure   = 完全不校验（不读也不写 known_hosts），仅用于一次性排障
+  # 三种策略下「指纹变了」都一律拒绝（SSH_HOSTKEY_MISMATCH）
+  policy: accept-new
+  knownHostsFile: ''      # '' → <DSH_HOME>/known_hosts（OpenSSH 兼容格式）
+
+# ── SFTP ────────────────────────────────────────────────────────────────────
+sftp:
+  chunkBytes: 262144      # 分块大小
+  maxConcurrentChunks: 4  # 并发分块数
+  resume: true            # 目标已存在时按偏移续传
+  verify: size+mtime      # none | size+mtime | sha256（sha256 不一致 → SSH_SFTP_VERIFY_MISMATCH）
+  followSymlinks: false   # 默认不跟随符号链接
+  progressIntervalMs: 200 # 进度帧节流（≥200ms 或 ≥1MiB 发一次）
+
+# ── 凭据 ────────────────────────────────────────────────────────────────────
+secrets:
+  # credentials = 读取 ctx.credentials（~/.dsh/.credentials.yaml），可写
+  # env         = 只读启动环境变量，绝不触碰凭据库
+  provider: credentials
+  envPrefix: DSH_SSH_     # 环境变量覆盖前缀：<prefix><档案SLUG>_PASSWORD
+
+# ── 日志 ────────────────────────────────────────────────────────────────────
+logging:
+  level: info             # debug | info | warn | error
+  redact: true            # false = 关闭脱敏（等于放弃验收项「凭据不在日志明文中出现」）
+  redactKeys:             # 结构化脱敏：这些 key 的值一律替换为 ••••••••
+    - password
+    - passphrase
+    - privateKey
+    - secret
+    - token
+    - key
+    - authorization
+
+# ── 治理 ────────────────────────────────────────────────────────────────────
+confirmDangerous: true    # 删除/覆盖等危险操作在 UI 二次确认
+allowAgentTools: true     # 是否把 ssh_* 工具注册给模型
+tools:                    # 注册哪些 Agent 工具（名字必须与 ICD §0 一致）
+  - ssh_exec
+  - ssh_upload
+  - ssh_download
+  - ssh_list_dir
+  - ssh_sessions
+
+# ── UI ──────────────────────────────────────────────────────────────────────
+ui:
+  defaultWidthPx: 420     # 右侧栏默认宽度
+  locale: auto            # auto | zh | en
+  terminalFontSize: 13    # 终端字号
+  reconnectAttempts: 5    # 前端断流重连次数（指数退避）

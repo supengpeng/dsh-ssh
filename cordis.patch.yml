@@ -1,0 +1,107 @@
+# Bundle patch for @local/dsh-ssh — the DSH SSH plugin.
+#
+# One Host row. The `id` here must stay identical to `dsh.plugin.json`'s `id` and
+# to the exported `name` in ./src/index.ts — test/unit/identity.test.mjs asserts
+# the three agree.
+#
+# The `config` block below is the plugin's configuration layer as seen by
+# `dsh --profile <profile> --dump-config` and by `Config.listConfigs`. Every value
+# is written out explicitly so the composed profile is self-documenting; each one
+# equals the default declared in the Schemastery schema in ./src/config.ts, so
+# deleting any line changes nothing. Edit values here (or with the Config editor)
+# to change behaviour; delete a line to fall back to the schema default.
+- insert:
+    - id: dsh-ssh
+      name: '@local/dsh-ssh'
+      config:
+        # ── Storage ──────────────────────────────────────────────────────────
+        # '' = <DSH_HOME>/dsh-ssh/profiles.json (saved connections; secrets are
+        # never written here — only references into ctx.credentials).
+        profilesFile: ''
+        # '' = <DSH_HOME>/logs/dsh-ssh/audit.jsonl (JSONL, already redacted).
+        auditFile: ''
+        # ── Limits ───────────────────────────────────────────────────────────
+        # Concurrent live sessions (the 10-session acceptance run needs 10).
+        maxSessions: 10
+        # Operations allowed on one session before the queue refuses.
+        maxConcurrentOpsPerSession: 4
+        # Bytes kept per command stream (head+tail truncation), per channel.
+        maxOutputBytes: 262144
+        # ── Time ─────────────────────────────────────────────────────────────
+        connectTimeoutMs: 15000
+        operationTimeoutMs: 120000
+        # Grace between SIGTERM and SIGKILL when a command times out.
+        graceKillMs: 3000
+        keepaliveIntervalMs: 20000
+        keepaliveCountMax: 3
+        # ── Retry (only for codes marked retryable in docs/ICD.md §5) ────────
+        retries:
+          max: 2
+          backoffBaseMs: 500
+          backoffMaxMs: 5000
+          jitter: true
+        # ── Host keys ────────────────────────────────────────────────────────
+        # strict      = refuse an unknown host key (SSH_HOSTKEY_UNKNOWN)
+        # accept-new  = trust the first key seen, then pin it
+        # insecure    = never verify (explicitly recorded in the audit log)
+        hostKey:
+          policy: accept-new
+          # '' = <DSH_HOME>/known_hosts; accepts OpenSSH-known_hosts syntax.
+          knownHostsFile: ''
+        # ── SFTP ─────────────────────────────────────────────────────────────
+        sftp:
+          # Chunk size for guarded transfers (also the resume granularity).
+          chunkBytes: 262144
+          maxConcurrentChunks: 4
+          resume: true
+          # none | size+mtime | sha256 (sha256 reads the whole file twice)
+          verify: size+mtime
+          followSymlinks: false
+          # Progress frames are coalesced to this cadence (also ≥1 MiB).
+          progressIntervalMs: 200
+        # ── Secrets ──────────────────────────────────────────────────────────
+        # credentials = ctx.credentials (persisted outside the profile);
+        # env         = read DSH_SSH_<PROFILE>_PASSWORD/_PASSPHRASE at connect.
+        secrets:
+          provider: credentials
+          envPrefix: DSH_SSH_
+        # ── Logging ──────────────────────────────────────────────────────────
+        logging:
+          # debug | info | warn | error
+          level: info
+          # Structural redaction of these key names plus every tracked secret.
+          redact: true
+          redactKeys:
+            - password
+            - passphrase
+            - privateKey
+            - secret
+            - token
+            - key
+            - authorization
+        # ── Governance ───────────────────────────────────────────────────────
+        # Destructive operations (delete/overwrite/close-live-session) ask first.
+        confirmDangerous: true
+        # Master switch for the model-facing tools; the allowlist is below.
+        allowAgentTools: true
+        # Register the model-facing ssh_* tools. `ssh_connect`/`ssh_sessions` come
+        # first because every other tool needs a live session; prefer
+        # `ssh_connect { profileId }` (the secret stays in ctx.credentials) over an
+        # inline password, which would land in the call transcript.
+        tools:
+          - ssh_connect
+          - ssh_disconnect
+          - ssh_sessions
+          - ssh_exec
+          - ssh_upload
+          - ssh_download
+          - ssh_list_dir
+        # ── UI ───────────────────────────────────────────────────────────────
+        ui:
+          # Initial right-sidebar width; afterwards the user's drag wins.
+          defaultWidthPx: 420
+          # auto | zh | en
+          locale: auto
+          terminalFontSize: 13
+          # Stream re-connect attempts before the tab surfaces a manual retry.
+          reconnectAttempts: 5

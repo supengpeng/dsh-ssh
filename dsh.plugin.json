@@ -1,0 +1,71 @@
+{
+  "$comment": "Self-describing manifest for @local/dsh-ssh. DSH itself activates this bundle through package.json's `dsh.bundle.patch` -> ./cordis.patch.yml; this file mirrors the same identity for humans and tooling. The `id` here, the `id` of the insert row in cordis.patch.yml, and the exported `name` in src/index.ts must all be 'dsh-ssh' — test/unit/identity.test.mjs asserts that.",
+  "id": "dsh-ssh",
+  "packageName": "@local/dsh-ssh",
+  "exportName": "dsh-ssh",
+  "version": "0.1.0",
+  "kind": "host+client",
+  "entry": "./lib/index.js",
+  "source": "./src/index.ts",
+  "clientEntry": "./lib/client.js",
+  "clientSource": "./client/src/plugin.js",
+  "clientBuilder": "./scripts/build-client.mjs",
+  "patch": "./cordis.patch.yml",
+  "requires": {
+    "services": [
+      "tools"
+    ],
+    "optionalServices": [
+      "credentials",
+      "storage",
+      "approval",
+      "logger"
+    ],
+    "node": ">=20"
+  },
+  "remote": {
+    "namespace": "sshPlugin",
+    "serviceKey": "sshPlugin",
+    "protocol": "typert-remote/src-json"
+  },
+  "client": {
+    "tabKind": "ssh",
+    "tabId": "ssh",
+    "slots": {
+      "panelIcon": "sidebar.panellist",
+      "tabBody": "sidebar.right.pane.tab",
+      "tabTitle": "sidebar.right.pane.tab.title"
+    },
+    "externals": []
+  },
+  "tools": [
+    "ssh_connect",
+    "ssh_disconnect",
+    "ssh_sessions",
+    "ssh_exec",
+    "ssh_upload",
+    "ssh_download",
+    "ssh_list_dir"
+  ],
+  "configSchema": "./src/config.ts#Config",
+  "defaults": {
+    "maxSessions": 10,
+    "maxConcurrentOpsPerSession": 4,
+    "connectTimeoutMs": 15000,
+    "operationTimeoutMs": 120000,
+    "keepaliveIntervalMs": 20000,
+    "keepaliveCountMax": 3,
+    "hostKey.policy": "accept-new",
+    "sftp.chunkBytes": 262144,
+    "sftp.maxConcurrentChunks": 4,
+    "sftp.resume": true,
+    "sftp.verify": "size+mtime",
+    "secrets.provider": "credentials",
+    "logging.level": "info",
+    "logging.redact": true,
+    "ui.defaultWidthPx": 420,
+    "ui.locale": "auto",
+    "ui.terminalFontSize": 13,
+    "ui.reconnectAttempts": 5
+  }
+}

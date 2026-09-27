@@ -1,0 +1,77 @@
+# SSH 插件配置示例：生产加固
+# ─────────────────────────────────────────────────────────────────────────────
+# 面向「连真实生产主机」的取舍：主机密钥严格校验、审计留痕、不给模型工具
+# 开写权限、SFTP 传输做校验和比对。
+#
+# 复制进 profile `cordis.patch.yml` 的 dsh-ssh 行（只写你要覆盖的项）：
+#
+#   - id: dsh-ssh
+#     name: '@local/dsh-ssh'
+#     config:
+#       hostKey:
+#         policy: strict
+#         knownHostsFile: /etc/dsh/ssh/known_hosts
+#       ...
+
+# 1) 主机密钥：全部走严格校验。
+#    先用 ssh-keyscan 把目标主机写进 known_hosts（插件也能用 accept-new 自动写入，
+#    但生产环境通常希望由运维统一灌入）：
+#      ssh-keyscan -p 22 -t rsa,ecdsa,ed25519 prod.example.com >> /etc/dsh/ssh/known_hosts
+hostKey:
+  policy: strict
+  knownHostsFile: /etc/dsh/ssh/known_hosts
+
+# 2) 审计：单独放一个受控目录，便于集中收集（插件日志 plugin.jsonl 会落在同目录）。
+#    审计条目在**写入前**就完成脱敏，因此可以把审计文件交给日志系统而不担心凭据。
+auditFile: /var/log/dsh-ssh/audit.jsonl
+
+# 3) 连接档案：放在受控目录。文件权限由插件以 0600 创建，
+#    且**只存引用名**，不存任何明文。
+profilesFile: /etc/dsh/ssh/profiles.json
+
+# 4) 凭据：走凭据库（可写），环境变量仍可临时覆盖。
+secrets:
+  provider: credentials     # ~/.dsh/.credentials.yaml（或部署时指定的路径）
+  envPrefix: DSH_SSH_       # DSH_SSH_<档案SLUG>_PASSWORD 优先级最高、只读
+
+# 5) 收紧并发与超时：生产侧宁可快速失败，也不要长时间占着连接。
+maxSessions: 5
+maxConcurrentOpsPerSession: 2
+connectTimeoutMs: 10000
+operationTimeoutMs: 60000
+retries:
+  max: 1
+  backoffBaseMs: 1000
+  backoffMaxMs: 5000
+  jitter: true
+
+# 6) 传输：一律 sha256 校验；不允许跟随符号链接（防越权读）。
+sftp:
+  verify: sha256
+  resume: true
+  followSymlinks: false
+  chunkBytes: 262144
+  maxConcurrentChunks: 2
+
+# 7) 治理：保留二次确认；不给模型注册任何 ssh_* 工具（人工操作才可用）。
+confirmDangerous: true
+allowAgentTools: false
+tools: []
+
+# 8) 日志：info 足够；脱敏必须为 true。
+logging:
+  level: info
+  redact: true
+  redactKeys:
+    - password
+    - passphrase
+    - privateKey
+    - secret
+    - token
+    - key
+    - authorization
+
+ui:
+  locale: zh
+  terminalFontSize: 13
+  reconnectAttempts: 3
