@@ -882,6 +882,46 @@ test('a rename asks for the new name and reports the target path', async () => {
   }
 })
 
+test('parentPath never returns a path that is its own parent', () => {
+  // A drive-rooted result used to keep a trailing separator, and a path ending in
+  // a separator IS its own parent - so "up" re-requested the same directory for
+  // ever and a local pane looked like it could not change directory. The gate is
+  // "applying parentPath twice must make progress, and a root must be a fixed
+  // point" - which is exactly what the old implementation violated on Windows.
+  const { restore, SSH } = boot()
+  try {
+    const ui = SSH.require('ssh.session.ui')
+
+    // Progress: each step must differ from the one before it.
+    assert.equal(ui.parentPath('C:\\ws\\sub'), 'C:\\ws')
+    assert.equal(ui.parentPath(ui.parentPath('C:\\ws\\sub')), 'C:\\')
+    assert.equal(ui.parentPath('C:\\ws\\sub\\'), 'C:\\ws', 'trailing separators do not change the answer')
+    assert.equal(ui.parentPath('C:\\ws\\sub'), 'C:\\ws')
+    assert.notEqual(
+      ui.parentPath('C:\\Users\\Administrator\\.dsh\\profiles\\'),
+      'C:\\Users\\Administrator\\.dsh\\profiles\\',
+      'the Windows shape that produced the frozen "up" control must move now',
+    )
+
+    // Roots are fixed points (repeatable, never '/'), and the POSIX side is intact.
+    for (const root of ['C:\\', '\\', '/', '/srv']) {
+      const once = ui.parentPath(root)
+      assert.equal(ui.parentPath(once), once, `${root} must be a fixed point`)
+    }
+    // A drive-relative root is still a *stable* answer that never crosses over to
+    // the POSIX root - answering '/' here would silently move the pane to a
+    // different filesystem. `files.js` additionally normalises this shape with
+    // `normalizeDirPath()`, so the exact spelling is not part of the contract.
+    const driveRelative = ui.parentPath('C:')
+    assert.notEqual(driveRelative, '/', 'a drive-relative root must not answer /')
+    assert.equal(ui.parentPath(driveRelative), driveRelative, 'and must be a fixed point')
+    assert.equal(ui.parentPath('/srv/etc'), '/srv')
+    assert.equal(ui.parentPath(''), '')
+  } finally {
+    restore()
+  }
+})
+
 test('chmod validates the octal mode before it is applied', () => {
   const { restore, SSH } = boot()
   try {

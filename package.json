@@ -68,7 +68,8 @@
     "test:perf": "node --test --test-concurrency=1 --test-timeout=600000 \"test/perf/*.test.mjs\"",
     "test:real": "node --test --test-concurrency=1 --test-timeout=120000 test/integration/real-target.test.mjs",
     "verify:all": "node scripts/verify-all.mjs",
-    "verify": "npm run typecheck && npm run build && npm test"
+    "verify": "npm run typecheck && npm run build && npm test",
+    "docs:shots": "node scripts/shot-files.mjs"
   },
   "dependencies": {
     "@deepseek-ai/dsh-typert-protocol": "0.1.5-rc.3",

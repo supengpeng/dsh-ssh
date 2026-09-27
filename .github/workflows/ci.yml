@@ -1,0 +1,83 @@
+# Continuous integration for @local/dsh-ssh.
+#
+# Two things this workflow exists to catch, both learned the hard way while
+# building the plugin:
+#
+#   1. `lib/` is committed (DSH consumes the built `lib/index.js` and
+#      `lib/client.js` directly), so a source change that was never rebuilt ships
+#      stale bytes to every user. `build-client.mjs --check` and the generated
+#      mirrors make that drift a red build instead of a silent one.
+#   2. The client half loads `lib/client.js` in most component tests, so the build
+#      must precede those tests. That is the R8 order enforced below: unit tests
+#      first, then the build, then the client suite against the real artifact.
+#
+# Env-gated suites (real SSH target, OpenSSH interop) skip themselves when their
+# variables are absent, so CI is green without a target host rather than fake-green.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+
+    name: node ${{ matrix.node }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Unit tests (host half)
+        run: npm run test:unit
+
+      - name: Build host half + client bundle
+        run: npm run build
+
+      - name: Generated artifacts are in sync
+        run: |
+          node scripts/build-client.mjs --check
+          test -f locale/zh.json && test -f locale/en.json
+          test -f client/src/chrome/locale.gen.js
+
+      - name: Client tests (against the built bundle)
+        run: npm run test:client
+
+      - name: Integration tests (env-gated suites skip)
+        run: npm run test:integration
+
+      - name: Contract gate — ICD §4 method table
+        run: DSH_SSH_STRICT_ICD=1 node --test --test-concurrency=1 test/integration/icd-conformance.test.mjs
+
+      - name: Lint
+        run: node scripts/lint.mjs
+
+      - name: Fail if the build dirtied the tree
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the build changed tracked files — commit the regenerated artifacts"
+            git --no-pager diff --stat
+            exit 1
+          fi
