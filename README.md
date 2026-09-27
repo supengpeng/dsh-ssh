@@ -13,24 +13,63 @@
 
 ## 1. 安装
 
-前置：DSH 桌面版（自带 Node ≥ 20）。本包是**免重启**装载的本地插件。
+前置：一个 DSH profile —— **桌面版**（Electron 应用，profile 名通常为 `desktop`）或**网页端**（`dsh web`，profile 名 `web`）。本包是**免重启**装载的本地插件。
+
+### 1.1 选哪种 profile，以及两种装载路线
+
+| | 桌面端（Electron） | 网页端（`dsh web`） |
+|---|---|---|
+| 启动方式 | 打开 DSH 桌面应用 | 终端执行 `dsh web`，浏览器打开其地址 |
+| 本机在用 | `--profile desktop` | `--profile web` |
+| 装载路线 | **patch 路线**：patch 层插入一条托管 Loader 行 | **bundles 路线**：写进 `dsh.profile.bundles`，再由 patch 层按 id 启用 |
+
+两条路线都能用，**一条路线装一个插件**即可。同时用两条会各加一行（`--check` 会给告警；本机 desktop 就是这个状态，实测仍可用，但不是推荐形态）。
+
+### 1.2 安装（按你的 profile 选一条）
 
 ```powershell
-# 1) 让 profile 依赖指向本仓库（link: 形式，改代码即生效）
-node scripts/profile-install.mjs --step deps      # 写 profile package.json（带备份）
-#    …按提示在 profile 目录执行一次 pnpm install（或让脚本代为执行）
-# 2) 在 profile 的 cordis.patch.yml 里插入本插件的托管块
-node scripts/profile-install.mjs --step patch
-# 3) 查看状态 / 回滚
-node scripts/profile-install.mjs --status
-node scripts/profile-install.mjs --uninstall
+# 桌面端（patch 路线，本机默认）
+node scripts/profile-install.mjs --profile desktop --install-deps
+
+# 网页端（bundles 路线；--install-deps 会代为在 profile 目录执行 pnpm install）
+node scripts/profile-install.mjs --profile web --use-bundles --install-deps
+```
+
+`--profile` 既接受**裸 profile 名**（`web` / `desktop`，自动解析到 `$DSH_HOME/profiles/<name>`），也接受 profile **目录路径**。每一步写入前都会生成时间戳备份（`*.bak-dsh-ssh-<stamp>`）。
+
+### 1.3 验收：确认"真的装上了、而且能组成"
+
+```powershell
+# 一条命令给结论：路线、各块是否存在、node_modules 链接、以及组成是否成功
+node scripts/profile-install.mjs --profile web --check   # 有问题时退出码非 0
+
+# 组成里应当恰好有一条 dsh-ssh 行，且带完整 config
+dsh --profile web --dump-config | Select-String -Pattern 'dsh-ssh' -Context 0,8
+```
+
+`--check` 的 `composition: ok` 意味着 DSH 真的解析了这个 profile 并且只找到一条插件行——这是唯一能回答"它到底加载了吗"的检查。网页端随后在浏览器里应当看到：**SSH 图标出现在侧栏面板列表** → 新建连接 → 会话页签（终端 / 命令 / 文件 / 日志 / 活动）。
+
+回滚：`node scripts/profile-install.mjs --profile web --uninstall`。
+
+### 1.4 故障排查（web 端）
+
+- **`dsh --profile web --dump-config` 报 `cannot resolve profile bundle "@deepseek-ai/dsh-experimental-…"`**：这个 profile 的 `dsh.profile.bundles` 里声明了一个既不在 DSH 安装里、也不在 profile 依赖里的包（本机就是因为 `@deepseek-ai/dsh-experimental-agent-team-profile` / `-auto-review` 而**整个 web profile 起不来**，与 dsh-ssh 无关）。处置：把它从 `dsh.profile.bundles` 摘掉，或按报错提示 `dsh plugin --profile web install` 把它装进 profile 依赖。
+- **`route: none` 或组成里没有 `dsh-ssh` 行**：装到了另一个 profile；用 `--profile <名字>` 指对目标，然后重新 `--check`。
+- **改了 `client/src/**` 后网页端没变化**：必须重建 `lib/client.js`（`pnpm run build:client`）；**页面只在该文件字节变化时重新执行 `apply()`**。host 侧改了 `src/**` 要重建 `lib/**`（`pnpm run build:host`）——装载时写入的 hmr watch 块会让重建后的 `lib/`、`src/`、`client/src/` 被热重载，无需重启应用。
+- **`--check` 报 `both routes are in use`**：patch 层托管块与 `dsh.profile.bundles` 各声明了一次。删掉其中一条（`--uninstall` 会同时清掉托管块与 bundle 条目）。
+
+### 1.5 其它常用命令
+
+```powershell
+node scripts/profile-install.mjs --profile web --status     # 只报告，不改文件
+node scripts/profile-install.mjs --profile web --dry-run    # 只打印将要写入的文件
+node scripts/profile-install.mjs --help
 ```
 
 要点（M0 实测结论，见 `docs/M0-SPIKE.md`）：
 
-- profile 的 `cordis.patch.yml` 是**共写文件**，只能通过 `# >>> dsh-ssh >>>` 标记块增删；**禁止整文件重写**。
-- **不要**同时把本包加进 `dsh.profile.bundles`（会产生重复行）。
-- host 侧改动要重跑 `apply()` 时，用 `plugin_manager` 把 `include:dsh-ssh` 行 toggle 关→开（`entryId` 是 `include:dsh-ssh`）；改 `client/src/**` 必须重建 `lib/client.js`，**页面只在该文件字节变化时重新执行 apply()**。
+- profile 的 `cordis.patch.yml` 是**共写文件**，本脚本只增删自己的 `# >>> dsh-ssh … >>>` 标记块；**禁止整文件重写**。
+- host 侧改动要重跑 `apply()` 时，用 `plugin_manager` 把 `include:dsh-ssh` 行 toggle 关→开（`entryId` 是 `include:dsh-ssh`）。
 
 ## 2. 配置
 

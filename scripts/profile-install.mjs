@@ -26,8 +26,10 @@
  * Every write is preceded by a timestamped backup of the file it changes.
  */
 
+import { spawnSync } from 'node:child_process'
 import { copyFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -41,15 +43,28 @@ const MARKER_END = `# <<< dsh-ssh <<<`
 /** The hot-reload watch row; a separate block because a hand-edited one existed first. */
 const HMR_MARKER_BEGIN = `# >>> dsh-ssh hmr watch (managed by dsh-ssh) >>>`
 const HMR_MARKER_END = `# <<< dsh-ssh hmr watch <<<`
+/**
+ * The bundles route's companion block.
+ *
+ * A profile that declares the package in `dsh.profile.bundles` still carries a
+ * materialised `dsh-ssh` row with `disabled: true`, so the row has to be enabled
+ * by id. This replaces the insert row rather than joining it: two rows with the
+ * same id are not what either route means.
+ */
+const ENABLE_MARKER_BEGIN = `# >>> dsh-ssh enable (managed by scripts/profile-install.mjs) >>>`
+const ENABLE_MARKER_END = `# <<< dsh-ssh enable <<<`
 
 function parseArgs(argv) {
-  const args = { profile: null, dryRun: false, uninstall: false, status: false, step: 'both' }
+  const args = { profile: null, dryRun: false, uninstall: false, status: false, check: false, installDeps: false, useBundles: false, step: 'both' }
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
     if (arg === '--profile') args.profile = argv[++index]
     else if (arg === '--dry-run') args.dryRun = true
     else if (arg === '--uninstall') args.uninstall = true
     else if (arg === '--status') args.status = true
+    else if (arg === '--check') args.check = true
+    else if (arg === '--install-deps') args.installDeps = true
+    else if (arg === '--use-bundles') args.useBundles = true
     else if (arg === '--step') args.step = argv[++index]
     else if (arg === '--help' || arg === '-h') args.help = true
     else throw new Error(`unknown argument: ${arg}`)
@@ -58,15 +73,46 @@ function parseArgs(argv) {
   return args
 }
 
+/**
+ * Resolve `--profile` to a directory.
+ *
+ * A bare name is what people actually type (`--profile web`, `--profile
+ * desktop`), and the profiles live under `$DSH_HOME/profiles/<name>`; a path is
+ * still accepted so a throwaway profile outside DSH_HOME keeps working.
+ */
+function resolveProfileDir(value) {
+  if (value === null) return null
+  const candidate = resolve(value)
+  if (existsSync(join(candidate, 'package.json'))) return candidate
+  const dshHome = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== '' ? process.env.DSH_HOME : join(homedir(), '.dsh')
+  const named = join(dshHome, 'profiles', value)
+  if (existsSync(join(named, 'package.json'))) return named
+  return candidate
+}
+
 function usage() {
-  console.log(`usage: node scripts/profile-install.mjs --profile <dir> [--dry-run|--uninstall|--status] [--step both|deps|patch]`)
+  console.log(`usage: node scripts/profile-install.mjs --profile <name|dir> [options]`)
   console.log('')
-  console.log('  --step deps   edit package.json only (then run pnpm install in the profile)')
-  console.log('  --step patch  edit cordis.patch.yml only (the Loader row)')
+  console.log('  --step both|deps|patch  limit the edit to package.json or the patch layer')
+  console.log('  --use-bundles           declare the plugin in dsh.profile.bundles instead of')
+  console.log('                          inserting a Loader row (the route the web profile uses);')
+  console.log('                          adds the enable override and drops the insert block')
+  console.log('  --install-deps          run `pnpm install` in the profile afterwards, so the')
+  console.log('                          link: dependency actually appears in node_modules')
+  console.log('  --status                report what is installed, which route is in use, and')
+  console.log('                          whether the profile still composes')
+  console.log('  --check                 same report, but exit non-zero when something is wrong')
+  console.log('  --dry-run               print the files that would change, write nothing')
+  console.log('  --uninstall             remove the dependency, the managed blocks and the bundle entry')
   console.log('')
-  console.log('  On a live profile, use --step deps + pnpm install FIRST, then --step patch:')
+  console.log('  On a live profile, use --step deps + --install-deps FIRST, then --step patch:')
   console.log('  the patch layer reloads immediately, and a row whose module is not yet')
   console.log('  linked would fail its import.')
+  console.log('')
+  console.log('  Two routes exist, and mixing them is what the check warns about:')
+  console.log('    patch   (default)      a managed insert row in the profile patch layer')
+  console.log('    bundles (--use-bundles) a dsh.profile.bundles entry + an enable override;')
+  console.log('                            this is how the web profile declares the plugin')
 }
 
 function timestamp() {
@@ -108,6 +154,39 @@ function withoutDependency(json, name) {
   return `${JSON.stringify(parsed, null, 2)}\n`
 }
 
+/**
+ * Add `name` to `dsh.profile.bundles`.
+ *
+ * The other route: a bundle's own `cordis.patch.yml` supplies its Loader row, so
+ * the profile only has to declare the package. This is how the `web` profile
+ * declares the plugin, while `desktop` uses the insert-row route.
+ */
+function withBundle(json, name) {
+  const parsed = JSON.parse(json)
+  parsed.dsh = parsed.dsh ?? {}
+  parsed.dsh.profile = parsed.dsh.profile ?? {}
+  const bundles = Array.isArray(parsed.dsh.profile.bundles) ? parsed.dsh.profile.bundles : []
+  if (!bundles.includes(name)) bundles.push(name)
+  parsed.dsh.profile.bundles = bundles
+  return `${JSON.stringify(parsed, null, 2)}\n`
+}
+
+function withoutBundle(json, name) {
+  const parsed = JSON.parse(json)
+  const bundles = parsed.dsh?.profile?.bundles
+  if (Array.isArray(bundles)) parsed.dsh.profile.bundles = bundles.filter((entry) => entry !== name)
+  return `${JSON.stringify(parsed, null, 2)}\n`
+}
+
+function bundleDeclared(json, name) {
+  try {
+    const bundles = JSON.parse(json)?.dsh?.profile?.bundles
+    return Array.isArray(bundles) && bundles.includes(name)
+  } catch {
+    return false
+  }
+}
+
 /** The managed block appended to the profile's patch layer. */
 function managedBlock() {
   return [
@@ -124,6 +203,20 @@ function managedBlock() {
     '          defaultWidthPx: 420',
     '          locale: auto',
     MARKER_END,
+    '',
+  ].join('\n')
+}
+
+/** The enable override that accompanies the bundles route. */
+function enableBlock() {
+  return [
+    ENABLE_MARKER_BEGIN,
+    '# The plugin comes from `dsh.profile.bundles` above; its own cordis.patch.yml',
+    '# supplies the Loader row (with the full config), and the materialised row is',
+    '# disabled, so it has to be enabled by id here.',
+    `- id: ${ENTRY_ID}`,
+    '  disabled: false',
+    ENABLE_MARKER_END,
     '',
   ].join('\n')
 }
@@ -191,28 +284,115 @@ function removeManaged(text, begin, end) {
   return (text.slice(0, start) + text.slice(after)).replace(/\n{3,}/g, '\n\n')
 }
 
-function applyBlock(text) {
-  return applyManaged(applyManaged(text, MARKER_BEGIN, MARKER_END, managedBlock()), HMR_MARKER_BEGIN, HMR_MARKER_END, hmrBlock())
+/**
+ * Write the patch layer for the chosen route.
+ *
+ * `bundles` route: the enable override plus the HMR block, and no insert row.
+ * `patch` route: the insert row plus the HMR block, and no enable override —
+ * each route owns exactly one way of introducing the row.
+ */
+function applyBlock(text, route) {
+  const withHmr = applyManaged(text, HMR_MARKER_BEGIN, HMR_MARKER_END, hmrBlock())
+  if (route === 'bundles') {
+    return applyManaged(removeManaged(withHmr, MARKER_BEGIN, MARKER_END), ENABLE_MARKER_BEGIN, ENABLE_MARKER_END, enableBlock())
+  }
+  return applyManaged(removeManaged(withHmr, ENABLE_MARKER_BEGIN, ENABLE_MARKER_END), MARKER_BEGIN, MARKER_END, managedBlock())
 }
 
 function removeBlock(text) {
-  return removeManaged(removeManaged(text, MARKER_BEGIN, MARKER_END), HMR_MARKER_BEGIN, HMR_MARKER_END)
+  return removeManaged(
+    removeManaged(removeManaged(text, MARKER_BEGIN, MARKER_END), HMR_MARKER_BEGIN, HMR_MARKER_END),
+    ENABLE_MARKER_BEGIN,
+    ENABLE_MARKER_END,
+  )
 }
 
-function report(status, profileDir) {
+/**
+ * Ask DSH to compose the profile and report what it says.
+ *
+ * This is the only check that answers the question a person actually has
+ * ("does it load?"), and it catches the failure this script cannot see on its
+ * own: a profile whose `dsh.profile.bundles` names a package that resolves
+ * neither from the installation nor from the profile. `--dump-config` prints
+ * the composed tree and exits.
+ */
+function compositionCheck(profileDir) {
+  const name = basename(profileDir)
+  const result = spawnSync('dsh', ['--profile', name, '--dump-config'], { encoding: 'utf8', timeout: 120_000, shell: false })
+  if (result.error !== undefined && result.error !== null) {
+    return { ran: false, ok: false, detail: `could not run \`dsh\` (${result.error.code ?? result.error.message})` }
+  }
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`
+  // The Electron application owns its profile and refuses CLI introspection. That
+  // is a limitation of *this check*, not a defect in the profile: reporting it as
+  // a failure would make the check cry wolf on the profile that works.
+  if (/managed exclusively by the Electron application/i.test(output)) {
+    return { ran: false, ok: true, detail: 'the Electron app owns this profile; compose it from the app' }
+  }
+  const rows = (output.match(new RegExp(`^- id: ${ENTRY_ID}$`, 'gm')) ?? []).length
+  if (result.status !== 0) {
+    const firstError = output.split('\n').find((line) => /error|cannot resolve/i.test(line)) ?? output.split('\n')[0] ?? ''
+    return { ran: true, ok: false, rows, detail: firstError.trim().slice(0, 160) }
+  }
+  return { ran: true, ok: rows === 1, rows, detail: rows === 1 ? `1 row for ${ENTRY_ID}` : `${rows} rows for ${ENTRY_ID}` }
+}
+
+/** Run the profile's own install so the `link:` dependency reaches node_modules. */
+function installProfileDeps(profileDir, dryRun) {
+  if (dryRun) {
+    console.log(`would run: pnpm install (in ${profileDir})`)
+    return true
+  }
+  // A single command string with `shell: true` on Windows (pnpm is a .cmd shim),
+  // and no argument array: passing args *and* a shell is what raises DEP0190.
+  const result =
+    process.platform === 'win32'
+      ? spawnSync('pnpm install', { cwd: profileDir, stdio: 'inherit', shell: true })
+      : spawnSync('pnpm', ['install'], { cwd: profileDir, stdio: 'inherit' })
+  return result.status === 0
+}
+
+function report(status, profileDir, { compose = false } = {}) {
   const packageFile = join(profileDir, 'package.json')
   const patchFile = join(profileDir, 'cordis.patch.yml')
-  const hasDep = existsSync(packageFile) && readFileSync(packageFile, 'utf8').includes(PACKAGE_NAME)
-  const hasRow = existsSync(patchFile) && readFileSync(patchFile, 'utf8').includes(MARKER_BEGIN)
-  const hasHmr = existsSync(patchFile) && readFileSync(patchFile, 'utf8').includes(HMR_MARKER_BEGIN)
+  const packageJson = existsSync(packageFile) ? readFileSync(packageFile, 'utf8') : ''
+  const patchYml = existsSync(patchFile) ? readFileSync(patchFile, 'utf8') : ''
+  const hasDep = packageJson.includes(PACKAGE_NAME)
+  const hasBundled = bundleDeclared(packageJson, PACKAGE_NAME)
+  const hasRow = patchYml.includes(MARKER_BEGIN)
+  const hasEnable = patchYml.includes(ENABLE_MARKER_BEGIN)
+  const hasHmr = patchYml.includes(HMR_MARKER_BEGIN)
   const linked = existsSync(join(profileDir, 'node_modules', '@local', 'dsh-ssh'))
+  const routes = [hasRow ? 'patch' : null, hasBundled ? 'bundles' : null].filter(Boolean)
+  const composition = compose ? compositionCheck(profileDir) : null
+  // `problems` fail `--check`; `warnings` are printed but do not. The split is
+  // deliberate: a check that fails on a working profile trains people to ignore
+  // it, so only conditions with a demonstrated failure count.
+  const problems = []
+  const warnings = []
+  if (!hasDep) problems.push('the profile does not depend on the package')
+  if (routes.length === 0) problems.push('no route declares the plugin (neither an insert row nor a bundle entry)')
+  if (routes.length > 1) warnings.push('both routes are in use (an insert row and a bundle entry each add a row); one route is the intended shape')
+  if (hasEnable && !hasBundled) problems.push('an enable override exists without the bundle entry it belongs to')
+  if (composition !== null && composition.ran && !composition.ok) problems.push(`the profile does not compose: ${composition.detail}`)
+  if (composition !== null && !composition.ran) warnings.push(`composition not checked here: ${composition.detail}`)
+
   console.log(`${status} — profile: ${profileDir}`)
   console.log(`  package.json dependency : ${hasDep ? 'present' : 'absent'}`)
+  console.log(`  route                   : ${routes.length === 0 ? 'none' : routes.join(' + ')}`)
   console.log(`  cordis.patch.yml row    : ${hasRow ? 'present' : 'absent'}`)
+  console.log(`  enable override         : ${hasEnable ? 'present' : 'absent'}`)
   console.log(`  hmr watch block         : ${hasHmr ? 'present' : 'absent'}`)
   console.log(`  node_modules link       : ${linked ? 'present' : 'absent'}`)
+  if (composition !== null) {
+    console.log(`  composition             : ${composition.ran ? (composition.ok ? 'ok' : 'FAILED') : 'not checked'}`)
+    if (!composition.ok || !composition.ran) console.log(`    ${composition.detail}`)
+  }
   console.log(`  package dir             : ${PACKAGE_DIR}`)
-  return { hasDep, hasRow, hasHmr, linked }
+  console.log(`  verdict                 : ${problems.length === 0 ? 'ok' : `${problems.length} problem(s)`}`)
+  for (const problem of problems) console.log(`    ! ${problem}`)
+  for (const warning of warnings) console.log(`    - ${warning}`)
+  return { hasDep, hasBundled, hasRow, hasEnable, hasHmr, linked, routes, composition, problems, warnings }
 }
 
 const args = parseArgs(process.argv.slice(2))
@@ -221,25 +401,26 @@ if (args.help || !args.profile) {
   process.exit(args.help ? 0 : 2)
 }
 
-const profileDir = resolve(args.profile)
+const profileDir = resolveProfileDir(args.profile)
 if (!existsSync(join(profileDir, 'package.json'))) {
   console.error(`not a DSH profile (no package.json): ${profileDir}`)
   process.exit(2)
 }
 
-if (args.status) {
-  report('STATUS', profileDir)
-  process.exit(0)
+if (args.status || args.check) {
+  const state = report(args.check ? 'CHECK' : 'STATUS', profileDir, { compose: true })
+  process.exit(args.check && state.problems.length > 0 ? 1 : 0)
 }
 
 const packageFile = join(profileDir, 'package.json')
 const patchFile = join(profileDir, 'cordis.patch.yml')
+const route = args.useBundles ? 'bundles' : 'patch'
 const changes = []
 
 if (args.uninstall) {
   if (args.step !== 'patch') {
     const packageBackup = backup(packageFile, args.dryRun)
-    const next = withoutDependency(readFileSync(packageFile, 'utf8'), PACKAGE_NAME)
+    const next = withoutBundle(withoutDependency(readFileSync(packageFile, 'utf8'), PACKAGE_NAME), PACKAGE_NAME)
     changes.push({ file: packageFile, next, backup: packageBackup })
   }
   if (args.step !== 'deps' && existsSync(patchFile)) {
@@ -249,15 +430,17 @@ if (args.uninstall) {
 } else {
   if (args.step !== 'patch') {
     const packageBackup = backup(packageFile, args.dryRun)
-    const next = withDependency(readFileSync(packageFile, 'utf8'), PACKAGE_NAME, linkSpecifier())
+    const withLink = withDependency(readFileSync(packageFile, 'utf8'), PACKAGE_NAME, linkSpecifier())
+    const next = route === 'bundles' ? withBundle(withLink, PACKAGE_NAME) : withLink
     changes.push({ file: packageFile, next, backup: packageBackup })
   }
   if (args.step !== 'deps' && existsSync(patchFile)) {
     const patchBackup = backup(patchFile, args.dryRun)
-    changes.push({ file: patchFile, next: applyBlock(readFileSync(patchFile, 'utf8')), backup: patchBackup })
+    changes.push({ file: patchFile, next: applyBlock(readFileSync(patchFile, 'utf8'), route), backup: patchBackup })
   }
 }
 
+let wrote = false
 for (const change of changes) {
   const before = readFileSync(change.file, 'utf8')
   if (before === change.next) {
@@ -269,13 +452,35 @@ for (const change of changes) {
     continue
   }
   writeFileSync(change.file, change.next, 'utf8')
+  wrote = true
   console.log(`wrote ${change.file}${change.backup ? ` (backup: ${change.backup})` : ''}`)
 }
 
-report(args.uninstall ? 'UNINSTALLED' : 'INSTALLED', profileDir)
+if (args.installDeps && args.step !== 'patch') {
+  // The link: dependency is inert until the profile resolves it, which is the
+  // step the README used to ask the operator to remember.
+  console.log('')
+  console.log(`running pnpm install in ${profileDir} …`)
+  const installed = installProfileDeps(profileDir, args.dryRun)
+  if (!installed) {
+    console.error('pnpm install failed; the profile still does not link the package')
+    process.exitCode = 1
+  }
+} else if (wrote && args.step !== 'patch') {
+  console.log('')
+  console.log('Next: run `pnpm install` in the profile (or re-run this script with --install-deps).')
+}
+
+report(args.uninstall ? 'UNINSTALLED' : 'INSTALLED', profileDir, { compose: true })
 console.log('')
 console.log('Next steps:')
-console.log('  1. pnpm install in the profile directory, so the link appears in node_modules.')
+console.log('  1. Composition is checked above: `composition: ok` means DSH resolved the profile')
+console.log('     and found exactly one row for the plugin.')
 console.log('  2. Reload the DSH window. A live profile applies the patch layer without a restart;')
 console.log('     if the row does not appear, DSH must be restarted once.')
 console.log(args.uninstall ? '  3. Run pnpm install again to prune the stale link.' : '  3. The SSH icon appears in the sidebar panel list.')
+console.log('')
+console.log('Profiles differ: `desktop` (the Electron app) uses the patch route, and `web`')
+console.log('(`dsh web`) declares the plugin through dsh.profile.bundles — pass --use-bundles')
+console.log('for that shape. A profile whose bundles name a package that resolves neither from')
+console.log('the installation nor from the profile fails to compose; the check above says so.')
