@@ -71,9 +71,12 @@ jobs:
       - name: Typecheck (tsc --noEmit)
         run: pnpm run typecheck
 
-      - name: Unit tests (host half)
-        run: pnpm run test:unit
-
+      # The build comes before every test on purpose: `lib/**` is committed, and
+      # the suites import the implementation from `lib/**`, so testing first would
+      # test whatever happens to be committed rather than the sources in this
+      # checkout. With the build here, a stale committed artifact can no longer
+      # masquerade as a test failure — the "Fail if the build dirtied the tree"
+      # step at the end reports it for what it is.
       - name: Build host half + client bundle
         run: pnpm run build
 
@@ -82,6 +85,9 @@ jobs:
           node scripts/build-client.mjs --check
           test -f locale/zh.json && test -f locale/en.json
           test -f client/src/chrome/locale.gen.js
+
+      - name: Unit tests (host half)
+        run: pnpm run test:unit
 
       - name: Client tests (against the built bundle)
         run: pnpm run test:client
